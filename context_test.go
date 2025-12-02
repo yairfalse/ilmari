@@ -91,3 +91,45 @@ func TestApplyCreatesConfigMap(t *testing.T) {
 		}
 	})
 }
+
+// TestApplyUpdatesExistingResource verifies Apply updates if resource exists.
+func TestApplyUpdatesExistingResource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create initial ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-config",
+			},
+			Data: map[string]string{
+				"key": "value1",
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("first Apply failed: %v", err)
+		}
+
+		// Apply again with different value
+		cm.Data["key"] = "value2"
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("second Apply failed: %v", err)
+		}
+
+		// Verify updated value
+		got, err := ctx.Client.CoreV1().ConfigMaps(ctx.Namespace).Get(
+			context.Background(),
+			"test-config",
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			t.Fatalf("ConfigMap not found: %v", err)
+		}
+
+		if got.Data["key"] != "value2" {
+			t.Errorf("expected key=value2, got key=%s", got.Data["key"])
+		}
+	})
+}

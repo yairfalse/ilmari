@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -175,42 +176,63 @@ func (c *Context) Apply(obj runtime.Object) error {
 		cm := o.DeepCopy()
 		cm.Namespace = c.Namespace
 		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, cm, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
+		}
 		return err
 
 	case *corev1.Secret:
 		secret := o.DeepCopy()
 		secret.Namespace = c.Namespace
 		_, err := c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, secret, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.CoreV1().Secrets(c.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
+		}
 		return err
 
 	case *corev1.Service:
 		svc := o.DeepCopy()
 		svc.Namespace = c.Namespace
 		_, err := c.Client.CoreV1().Services(c.Namespace).Create(ctx, svc, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.CoreV1().Services(c.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
+		}
 		return err
 
 	case *corev1.Pod:
 		pod := o.DeepCopy()
 		pod.Namespace = c.Namespace
 		_, err := c.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.CoreV1().Pods(c.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
+		}
 		return err
 
 	case *appsv1.Deployment:
 		deploy := o.DeepCopy()
 		deploy.Namespace = c.Namespace
 		_, err := c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, deploy, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.AppsV1().Deployments(c.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
+		}
 		return err
 
 	case *appsv1.StatefulSet:
 		ss := o.DeepCopy()
 		ss.Namespace = c.Namespace
 		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, ss, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Update(ctx, ss, metav1.UpdateOptions{})
+		}
 		return err
 
 	case *appsv1.DaemonSet:
 		ds := o.DeepCopy()
 		ds.Namespace = c.Namespace
 		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, ds, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Update(ctx, ds, metav1.UpdateOptions{})
+		}
 		return err
 
 	default:
