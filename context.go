@@ -1,0 +1,202 @@
+// Package ilmari provides Kubernetes testing utilities for Go.
+//
+// Ilmari connects your tests to Kubernetes with isolated namespaces,
+// automatic cleanup, and failure diagnostics.
+//
+// Basic usage:
+//
+//	func TestMyController(t *testing.T) {
+//	    ilmari.Run(t, func(ctx *ilmari.Context) {
+//	        ctx.Apply(myDeployment)
+//	        ctx.WaitReady("deployment/myapp")
+//	    })
+//	}
+package ilmari
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/google/uuid"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+// Context provides a Kubernetes connection with an isolated namespace for testing.
+type Context struct {
+	// Client is the Kubernetes clientset
+	Client *kubernetes.Clientset
+
+	// Namespace is the isolated test namespace
+	Namespace string
+
+	// t is the test instance for logging
+	t *testing.T
+}
+
+// Config configures the test context behavior.
+type Config struct {
+	// KeepOnFailure keeps the namespace on test failure (default: true)
+	KeepOnFailure bool
+
+	// KeepAlways keeps the namespace even on success (debug mode)
+	KeepAlways bool
+
+	// Kubeconfig path (default: uses KUBECONFIG or ~/.kube/config)
+	Kubeconfig string
+}
+
+// DefaultConfig returns the default configuration.
+func DefaultConfig() Config {
+	return Config{
+		KeepOnFailure: true,
+		KeepAlways:    false,
+	}
+}
+
+// Run executes a test function with a fresh Context.
+// The namespace is automatically cleaned up on success.
+func Run(t *testing.T, fn func(ctx *Context)) {
+	RunWithConfig(t, DefaultConfig(), fn)
+}
+
+// RunWithConfig executes a test function with custom configuration.
+func RunWithConfig(t *testing.T, cfg Config, fn func(ctx *Context)) {
+	ctx, err := newContext(t, cfg)
+	if err != nil {
+		t.Fatalf("failed to create ilmari context: %v", err)
+	}
+
+	defer func() {
+		if t.Failed() && cfg.KeepOnFailure {
+			t.Logf("Test failed - keeping namespace %s for debugging", ctx.Namespace)
+			ctx.dumpDiagnostics()
+			return
+		}
+		if cfg.KeepAlways {
+			t.Logf("KeepAlways enabled - keeping namespace %s", ctx.Namespace)
+			return
+		}
+		if err := ctx.cleanup(); err != nil {
+			t.Logf("warning: failed to cleanup namespace: %v", err)
+		}
+	}()
+
+	fn(ctx)
+}
+
+// newContext creates a new test context with an isolated namespace.
+func newContext(t *testing.T, cfg Config) (*Context, error) {
+	// Load kubeconfig
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if cfg.Kubeconfig != "" {
+		loadingRules.ExplicitPath = cfg.Kubeconfig
+	}
+
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	// Create clientset
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	// Generate unique namespace
+	id := uuid.New().String()[:8]
+	namespace := fmt.Sprintf("ilmari-test-%s", id)
+
+	// Create namespace
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespace,
+			Labels: map[string]string{
+				"ilmari.io/test": "true",
+			},
+		},
+	}
+
+	_, err = client.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create namespace: %w", err)
+	}
+
+	t.Logf("Created test namespace: %s", namespace)
+
+	return &Context{
+		Client:    client,
+		Namespace: namespace,
+		t:         t,
+	}, nil
+}
+
+// cleanup deletes the test namespace.
+func (c *Context) cleanup() error {
+	err := c.Client.CoreV1().Namespaces().Delete(
+		context.Background(),
+		c.Namespace,
+		metav1.DeleteOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete namespace: %w", err)
+	}
+	c.t.Logf("Deleted test namespace: %s", c.Namespace)
+	return nil
+}
+
+// dumpDiagnostics prints diagnostic information on test failure.
+func (c *Context) dumpDiagnostics() {
+	c.t.Logf("\n--- Ilmari Diagnostics ---")
+	c.t.Logf("Namespace: %s (kept for debugging)", c.Namespace)
+
+	// TODO: Dump pod logs
+	// TODO: Dump events
+	// TODO: Dump resource states
+
+	c.t.Logf("--- End Diagnostics ---\n")
+}
+
+// Apply creates or updates a resource in the test namespace.
+func (c *Context) Apply(obj runtime.Object) error {
+	// TODO: Implement using dynamic client
+	return fmt.Errorf("Apply not yet implemented")
+}
+
+// Get retrieves a resource from the test namespace.
+func (c *Context) Get(name string, obj runtime.Object) error {
+	// TODO: Implement using dynamic client
+	return fmt.Errorf("Get not yet implemented")
+}
+
+// Delete removes a resource from the test namespace.
+func (c *Context) Delete(name string, obj runtime.Object) error {
+	// TODO: Implement using dynamic client
+	return fmt.Errorf("Delete not yet implemented")
+}
+
+// WaitReady waits for a resource to be ready.
+func (c *Context) WaitReady(resource string) error {
+	// TODO: Implement
+	return fmt.Errorf("WaitReady not yet implemented")
+}
+
+// Logs retrieves logs from a pod.
+func (c *Context) Logs(pod string) (string, error) {
+	// TODO: Implement
+	return "", fmt.Errorf("Logs not yet implemented")
+}
+
+// Exec executes a command in a pod.
+func (c *Context) Exec(pod string, cmd []string) (string, error) {
+	// TODO: Implement
+	return "", fmt.Errorf("Exec not yet implemented")
+}
