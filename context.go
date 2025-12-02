@@ -172,38 +172,45 @@ func (c *Context) Apply(obj runtime.Object) error {
 
 	switch o := obj.(type) {
 	case *corev1.ConfigMap:
-		o.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		cm := o.DeepCopy()
+		cm.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, cm, metav1.CreateOptions{})
 		return err
 
 	case *corev1.Secret:
-		o.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		secret := o.DeepCopy()
+		secret.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, secret, metav1.CreateOptions{})
 		return err
 
 	case *corev1.Service:
-		o.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Services(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		svc := o.DeepCopy()
+		svc.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().Services(c.Namespace).Create(ctx, svc, metav1.CreateOptions{})
 		return err
 
 	case *corev1.Pod:
-		o.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Pods(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		pod := o.DeepCopy()
+		pod.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 		return err
 
 	case *appsv1.Deployment:
-		o.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		deploy := o.DeepCopy()
+		deploy.Namespace = c.Namespace
+		_, err := c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, deploy, metav1.CreateOptions{})
 		return err
 
 	case *appsv1.StatefulSet:
-		o.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		ss := o.DeepCopy()
+		ss.Namespace = c.Namespace
+		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, ss, metav1.CreateOptions{})
 		return err
 
 	case *appsv1.DaemonSet:
-		o.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		ds := o.DeepCopy()
+		ds.Namespace = c.Namespace
+		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, ds, metav1.CreateOptions{})
 		return err
 
 	default:
