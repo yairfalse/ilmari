@@ -3,6 +3,7 @@ package ilmari
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -130,6 +131,58 @@ func TestApplyUpdatesExistingResource(t *testing.T) {
 
 		if got.Data["key"] != "value2" {
 			t.Errorf("expected key=value2, got key=%s", got.Data["key"])
+		}
+	})
+}
+
+// TestWaitReadyPod verifies WaitReady waits for a pod to be ready.
+func TestWaitReadyPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a simple pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-pod",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:latest",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// WaitReady should succeed once pod is running
+		start := time.Now()
+		err := ctx.WaitReady("pod/test-pod")
+		if err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		t.Logf("Pod became ready in %v", time.Since(start))
+	})
+}
+
+// TestWaitReadyInvalidFormat verifies WaitReady returns error for invalid format.
+func TestWaitReadyInvalidFormat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		err := ctx.WaitReady("invalid-format")
+		if err == nil {
+			t.Error("expected error for invalid format")
 		}
 	})
 }

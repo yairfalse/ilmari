@@ -16,7 +16,9 @@ package ilmari
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
@@ -253,9 +255,124 @@ func (c *Context) Delete(name string, obj runtime.Object) error {
 }
 
 // WaitReady waits for a resource to be ready.
+// Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
 func (c *Context) WaitReady(resource string) error {
-	// TODO: Implement
-	return fmt.Errorf("WaitReady not yet implemented")
+	return c.WaitReadyTimeout(resource, 60*time.Second)
+}
+
+// WaitReadyTimeout waits for a resource to be ready with custom timeout.
+func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		ready, err := c.isReady(kind, name)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for %s to be ready", resource)
+		case <-ticker.C:
+			// continue polling
+		}
+	}
+}
+
+// isReady checks if a resource is ready based on its type.
+func (c *Context) isReady(kind, name string) (bool, error) {
+	ctx := context.Background()
+
+	switch kind {
+	case "pod":
+		pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return isPodReady(pod), nil
+
+	case "deployment":
+		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return isDeploymentReady(deploy), nil
+
+	case "statefulset":
+		ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return isStatefulSetReady(ss), nil
+
+	case "daemonset":
+		ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return isDaemonSetReady(ds), nil
+
+	default:
+		return false, fmt.Errorf("unsupported resource type: %s", kind)
+	}
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func isDeploymentReady(deploy *appsv1.Deployment) bool {
+	if deploy.Spec.Replicas == nil {
+		return deploy.Status.ReadyReplicas > 0
+	}
+	return deploy.Status.ReadyReplicas == *deploy.Spec.Replicas
+}
+
+func isStatefulSetReady(ss *appsv1.StatefulSet) bool {
+	if ss.Spec.Replicas == nil {
+		return ss.Status.ReadyReplicas > 0
+	}
+	return ss.Status.ReadyReplicas == *ss.Spec.Replicas
+}
+
+func isDaemonSetReady(ds *appsv1.DaemonSet) bool {
+	return ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
+		ds.Status.DesiredNumberScheduled > 0
 }
 
 // Logs retrieves logs from a pod.
