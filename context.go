@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -167,8 +168,47 @@ func (c *Context) dumpDiagnostics() {
 
 // Apply creates or updates a resource in the test namespace.
 func (c *Context) Apply(obj runtime.Object) error {
-	// TODO: Implement using dynamic client
-	return fmt.Errorf("Apply not yet implemented")
+	ctx := context.Background()
+
+	switch o := obj.(type) {
+	case *corev1.ConfigMap:
+		o.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	case *corev1.Secret:
+		o.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	case *corev1.Service:
+		o.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().Services(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	case *corev1.Pod:
+		o.Namespace = c.Namespace
+		_, err := c.Client.CoreV1().Pods(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	case *appsv1.Deployment:
+		o.Namespace = c.Namespace
+		_, err := c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	case *appsv1.StatefulSet:
+		o.Namespace = c.Namespace
+		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	case *appsv1.DaemonSet:
+		o.Namespace = c.Namespace
+		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, o, metav1.CreateOptions{})
+		return err
+
+	default:
+		return fmt.Errorf("unsupported type: %T", obj)
+	}
 }
 
 // Get retrieves a resource from the test namespace.
