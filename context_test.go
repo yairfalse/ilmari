@@ -2,6 +2,7 @@ package ilmari
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,6 +184,52 @@ func TestWaitReadyInvalidFormat(t *testing.T) {
 		err := ctx.WaitReady("invalid-format")
 		if err == nil {
 			t.Error("expected error for invalid format")
+		}
+	})
+}
+
+// TestLogsRetrievesPodOutput verifies Logs returns pod output.
+func TestLogsRetrievesPodOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod that outputs a known string
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "echo-pod",
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:latest",
+						Command: []string{"sh", "-c", "echo 'hello from ilmari' && sleep 10"},
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/echo-pod"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Give it a moment to produce logs
+		time.Sleep(500 * time.Millisecond)
+
+		logs, err := ctx.Logs("echo-pod")
+		if err != nil {
+			t.Fatalf("Logs failed: %v", err)
+		}
+
+		if !strings.Contains(logs, "hello from ilmari") {
+			t.Errorf("expected logs to contain 'hello from ilmari', got: %s", logs)
 		}
 	})
 }

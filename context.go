@@ -16,6 +16,7 @@ package ilmari
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -377,8 +378,18 @@ func isDaemonSetReady(ds *appsv1.DaemonSet) bool {
 
 // Logs retrieves logs from a pod.
 func (c *Context) Logs(pod string) (string, error) {
-	// TODO: Implement
-	return "", fmt.Errorf("Logs not yet implemented")
+	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{})
+	stream, err := req.Stream(context.Background())
+	if err != nil {
+		return "", fmt.Errorf("failed to get logs: %w", err)
+	}
+	defer stream.Close()
+
+	buf := new(strings.Builder)
+	if _, err := io.Copy(buf, stream); err != nil {
+		return "", fmt.Errorf("failed to read logs: %w", err)
+	}
+	return buf.String(), nil
 }
 
 // Exec executes a command in a pod.
