@@ -311,8 +311,26 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 
 // Delete removes a resource from the test namespace.
 func (c *Context) Delete(name string, obj runtime.Object) error {
-	// TODO: Implement using dynamic client
-	return fmt.Errorf("Delete not yet implemented")
+	ctx := context.Background()
+
+	switch obj.(type) {
+	case *corev1.ConfigMap:
+		return c.Client.CoreV1().ConfigMaps(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case *corev1.Secret:
+		return c.Client.CoreV1().Secrets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case *corev1.Service:
+		return c.Client.CoreV1().Services(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case *corev1.Pod:
+		return c.Client.CoreV1().Pods(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case *appsv1.Deployment:
+		return c.Client.AppsV1().Deployments(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case *appsv1.StatefulSet:
+		return c.Client.AppsV1().StatefulSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case *appsv1.DaemonSet:
+		return c.Client.AppsV1().DaemonSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	default:
+		return fmt.Errorf("unsupported type: %T", obj)
+	}
 }
 
 // WaitReady waits for a resource to be ready.

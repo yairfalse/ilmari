@@ -265,3 +265,37 @@ func TestGetRetrievesResource(t *testing.T) {
 		}
 	})
 }
+
+// TestDeleteRemovesResource verifies Delete removes an existing resource.
+func TestDeleteRemovesResource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "delete-test",
+			},
+			Data: map[string]string{
+				"key": "value",
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Delete it
+		if err := ctx.Delete("delete-test", &corev1.ConfigMap{}); err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+
+		// Verify it's gone
+		got := &corev1.ConfigMap{}
+		err := ctx.Get("delete-test", got)
+		if err == nil {
+			t.Error("expected error getting deleted resource")
+		}
+	})
+}
