@@ -233,3 +233,35 @@ func TestLogsRetrievesPodOutput(t *testing.T) {
 		}
 	})
 }
+
+// TestGetRetrievesResource verifies Get retrieves an existing resource.
+func TestGetRetrievesResource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "get-test",
+			},
+			Data: map[string]string{
+				"foo": "bar",
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Get it back
+		got := &corev1.ConfigMap{}
+		if err := ctx.Get("get-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if got.Data["foo"] != "bar" {
+			t.Errorf("expected foo=bar, got foo=%s", got.Data["foo"])
+		}
+	})
+}

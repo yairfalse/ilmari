@@ -245,8 +245,68 @@ func (c *Context) Apply(obj runtime.Object) error {
 
 // Get retrieves a resource from the test namespace.
 func (c *Context) Get(name string, obj runtime.Object) error {
-	// TODO: Implement using dynamic client
-	return fmt.Errorf("Get not yet implemented")
+	ctx := context.Background()
+
+	switch o := obj.(type) {
+	case *corev1.ConfigMap:
+		got, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	case *corev1.Secret:
+		got, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	case *corev1.Service:
+		got, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	case *corev1.Pod:
+		got, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	case *appsv1.Deployment:
+		got, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	case *appsv1.StatefulSet:
+		got, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	case *appsv1.DaemonSet:
+		got, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		*o = *got
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported type: %T", obj)
+	}
 }
 
 // Delete removes a resource from the test namespace.
