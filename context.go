@@ -333,6 +333,73 @@ func (c *Context) Delete(name string, obj runtime.Object) error {
 	}
 }
 
+// List retrieves all resources of a type from the test namespace.
+func (c *Context) List(list runtime.Object) error {
+	ctx := context.Background()
+	opts := metav1.ListOptions{}
+
+	switch l := list.(type) {
+	case *corev1.ConfigMapList:
+		got, err := c.Client.CoreV1().ConfigMaps(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	case *corev1.SecretList:
+		got, err := c.Client.CoreV1().Secrets(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	case *corev1.ServiceList:
+		got, err := c.Client.CoreV1().Services(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	case *corev1.PodList:
+		got, err := c.Client.CoreV1().Pods(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	case *appsv1.DeploymentList:
+		got, err := c.Client.AppsV1().Deployments(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	case *appsv1.StatefulSetList:
+		got, err := c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	case *appsv1.DaemonSetList:
+		got, err := c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		*l = *got
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported type: %T", list)
+	}
+}
+
 // WaitReady waits for a resource to be ready.
 // Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
 func (c *Context) WaitReady(resource string) error {

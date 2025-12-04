@@ -299,3 +299,41 @@ func TestDeleteRemovesResource(t *testing.T) {
 		}
 	})
 }
+
+// TestListReturnsResources verifies List returns resources in namespace.
+func TestListReturnsResources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create two ConfigMaps
+		for _, name := range []string{"list-test-1", "list-test-2"} {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name,
+				},
+			}
+			if err := ctx.Apply(cm); err != nil {
+				t.Fatalf("Apply failed: %v", err)
+			}
+		}
+
+		// List them
+		list := &corev1.ConfigMapList{}
+		if err := ctx.List(list); err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+
+		// Check our ConfigMaps are present (namespace may have default ones)
+		found := 0
+		for _, cm := range list.Items {
+			if cm.Name == "list-test-1" || cm.Name == "list-test-2" {
+				found++
+			}
+		}
+		if found != 2 {
+			t.Errorf("expected to find 2 test ConfigMaps, found %d", found)
+		}
+	})
+}
