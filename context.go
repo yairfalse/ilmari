@@ -406,6 +406,104 @@ func (c *Context) WaitReady(resource string) error {
 	return c.WaitReadyTimeout(resource, 60*time.Second)
 }
 
+// WaitFor waits for a custom condition on a resource.
+// Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
+func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool) error {
+	return c.WaitForTimeout(resource, condition, 60*time.Second)
+}
+
+// WaitForTimeout waits for a custom condition with timeout.
+func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) error {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		obj, err := c.getResource(kind, name)
+		if err != nil {
+			return err
+		}
+		if obj != nil && condition(obj) {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for %s", resource)
+		case <-ticker.C:
+		}
+	}
+}
+
+// getResource fetches a resource by kind and name.
+func (c *Context) getResource(kind, name string) (interface{}, error) {
+	ctx := context.Background()
+
+	switch kind {
+	case "pod":
+		pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return pod, err
+
+	case "deployment":
+		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return deploy, err
+
+	case "statefulset":
+		ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return ss, err
+
+	case "daemonset":
+		ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return ds, err
+
+	case "configmap":
+		cm, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return cm, err
+
+	case "secret":
+		secret, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return secret, err
+
+	case "service":
+		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return svc, err
+
+	default:
+		return nil, fmt.Errorf("unsupported kind: %s", kind)
+	}
+}
+
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
 func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
 	parts := strings.SplitN(resource, "/", 2)

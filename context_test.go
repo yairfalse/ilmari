@@ -337,3 +337,52 @@ func TestListReturnsResources(t *testing.T) {
 		}
 	})
 }
+
+// TestWaitForCustomCondition verifies WaitFor with custom condition.
+func TestWaitForCustomCondition(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "waitfor-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:latest",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Wait for pod to have an IP assigned
+		err := ctx.WaitFor("pod/waitfor-test", func(obj interface{}) bool {
+			p, ok := obj.(*corev1.Pod)
+			if !ok {
+				return false
+			}
+			return p.Status.PodIP != ""
+		})
+		if err != nil {
+			t.Fatalf("WaitFor failed: %v", err)
+		}
+
+		// Verify pod has IP
+		got := &corev1.Pod{}
+		if err := ctx.Get("waitfor-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if got.Status.PodIP == "" {
+			t.Error("expected pod to have IP")
+		}
+	})
+}
