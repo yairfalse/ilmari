@@ -386,3 +386,72 @@ func TestWaitForCustomCondition(t *testing.T) {
 		}
 	})
 }
+
+// TestForwardMakesHTTPRequest verifies Forward can make HTTP requests.
+func TestForwardMakesHTTPRequest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a simple HTTP server pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "http-server",
+				Labels: map[string]string{
+					"app": "http-server",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "server",
+						Image: "nginx:alpine",
+						Ports: []corev1.ContainerPort{
+							{ContainerPort: 80},
+						},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply pod failed: %v", err)
+		}
+
+		// Create a service
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "http-server",
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{
+					"app": "http-server",
+				},
+				Ports: []corev1.ServicePort{
+					{Port: 80},
+				},
+			},
+		}
+		if err := ctx.Apply(svc); err != nil {
+			t.Fatalf("Apply svc failed: %v", err)
+		}
+
+		// Wait for pod to be ready
+		if err := ctx.WaitReady("pod/http-server"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Forward and make request
+		pf := ctx.Forward("svc/http-server", 80)
+		defer pf.Close()
+
+		resp, err := pf.Get("/")
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if resp.StatusCode != 200 {
+			t.Errorf("expected 200, got %d", resp.StatusCode)
+		}
+	})
+}

@@ -17,6 +17,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 )
 
 // Context provides a Kubernetes connection with an isolated namespace for testing.
@@ -639,4 +643,128 @@ func (c *Context) Logs(pod string) (string, error) {
 func (c *Context) Exec(pod string, cmd []string) (string, error) {
 	// TODO: Implement
 	return "", fmt.Errorf("Exec not yet implemented")
+}
+
+// PortForward represents an active port forward to a pod or service.
+type PortForward struct {
+	localPort  int
+	stopChan   chan struct{}
+	httpClient *http.Client
+	err        error
+}
+
+// Close closes the port forward.
+func (pf *PortForward) Close() {
+	if pf.stopChan != nil {
+		close(pf.stopChan)
+	}
+}
+
+// Get makes an HTTP GET request through the port forward.
+func (pf *PortForward) Get(path string) (*http.Response, error) {
+	if pf.err != nil {
+		return nil, pf.err
+	}
+	url := fmt.Sprintf("http://localhost:%d%s", pf.localPort, path)
+	return pf.httpClient.Get(url)
+}
+
+// Forward creates a port forward to a pod or service.
+// Resource format: "svc/name" or "pod/name"
+func (c *Context) Forward(resource string, port int) *PortForward {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		return &PortForward{err: fmt.Errorf("invalid resource format %q, expected kind/name", resource)}
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	// Get pod name
+	var podName string
+	ctx := context.Background()
+
+	switch kind {
+	case "pod":
+		podName = name
+	case "svc", "service":
+		// Get service and find a pod
+		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return &PortForward{err: fmt.Errorf("failed to get service: %w", err)}
+		}
+
+		// Find pods matching the service selector
+		selector := ""
+		for k, v := range svc.Spec.Selector {
+			if selector != "" {
+				selector += ","
+			}
+			selector += k + "=" + v
+		}
+
+		pods, err := c.Client.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: selector,
+		})
+		if err != nil {
+			return &PortForward{err: fmt.Errorf("failed to list pods: %w", err)}
+		}
+		if len(pods.Items) == 0 {
+			return &PortForward{err: fmt.Errorf("no pods found for service %s", name)}
+		}
+		podName = pods.Items[0].Name
+	default:
+		return &PortForward{err: fmt.Errorf("unsupported kind %q, use pod or svc", kind)}
+	}
+
+	// Set up port forward
+	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	if err != nil {
+		return &PortForward{err: fmt.Errorf("failed to get config: %w", err)}
+	}
+
+	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
+	if err != nil {
+		return &PortForward{err: fmt.Errorf("failed to create round tripper: %w", err)}
+	}
+
+	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", c.Namespace, podName)
+	hostIP := strings.TrimPrefix(config.Host, "https://")
+	hostIP = strings.TrimPrefix(hostIP, "http://")
+	serverURL := url.URL{Scheme: "https", Host: hostIP, Path: path}
+
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, &serverURL)
+
+	stopChan := make(chan struct{}, 1)
+	readyChan := make(chan struct{})
+
+	// Use port 0 to get a random available port
+	ports := []string{fmt.Sprintf("0:%d", port)}
+	pf, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard)
+	if err != nil {
+		return &PortForward{err: fmt.Errorf("failed to create port forward: %w", err)}
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- pf.ForwardPorts()
+	}()
+
+	// Wait for port forward to be ready
+	select {
+	case <-readyChan:
+	case err := <-errChan:
+		return &PortForward{err: fmt.Errorf("port forward failed: %w", err)}
+	}
+
+	forwardedPorts, err := pf.GetPorts()
+	if err != nil || len(forwardedPorts) == 0 {
+		return &PortForward{err: fmt.Errorf("failed to get forwarded ports: %w", err)}
+	}
+
+	return &PortForward{
+		localPort:  int(forwardedPorts[0].Local),
+		stopChan:   stopChan,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
 }
