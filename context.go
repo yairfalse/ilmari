@@ -467,7 +467,15 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	for {
 		obj, err := c.getResource(kind, name)
 		if err != nil {
-			return err
+			// Only return on permanent errors; retry on transient errors.
+			if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
+				return err
+			}
+			// For transient errors, optionally log and continue retrying.
+			// c.t.Logf("Transient error getting resource %s/%s: %v", kind, name, err)
+			// Continue to next iteration (wait and retry)
+		} else if obj != nil && condition(obj) {
+			return nil
 		}
 		if obj != nil && condition(obj) {
 			return nil
