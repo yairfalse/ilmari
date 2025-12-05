@@ -467,15 +467,7 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	for {
 		obj, err := c.getResource(kind, name)
 		if err != nil {
-			// Only return on permanent errors; retry on transient errors.
-			if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
-				return err
-			}
-			// For transient errors, optionally log and continue retrying.
-			// c.t.Logf("Transient error getting resource %s/%s: %v", kind, name, err)
-			// Continue to next iteration (wait and retry)
-		} else if obj != nil && condition(obj) {
-			return nil
+			return err
 		}
 		if obj != nil && condition(obj) {
 			return nil
@@ -567,15 +559,6 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 	for {
 		ready, err := c.isReady(kind, name)
 		if err != nil {
-			// Retry on transient errors, only fail on permanent errors
-			if apierrors.IsNotFound(err) || apierrors.IsTooManyRequests(err) {
-				// Transient error, continue polling
-				break
-			}
-			// For network errors, retry if temporary
-			if ne, ok := err.(interface{ Temporary() bool }); ok && ne.Temporary() {
-				break
-			}
 			return err
 		}
 		if ready {
@@ -586,7 +569,6 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for %s to be ready", resource)
 		case <-ticker.C:
-			// continue polling
 		}
 	}
 }
