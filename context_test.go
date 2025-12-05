@@ -220,16 +220,27 @@ func TestLogsRetrievesPodOutput(t *testing.T) {
 			t.Fatalf("WaitReady failed: %v", err)
 		}
 
-		// Give it a moment to produce logs
-		time.Sleep(500 * time.Millisecond)
-
-		logs, err := ctx.Logs("echo-pod")
-		if err != nil {
-			t.Fatalf("Logs failed: %v", err)
+		// Wait for logs to contain the expected output, up to a timeout
+		var logs string
+		var err error
+		found := false
+		const maxWait = 5 * time.Second
+		const pollInterval = 100 * time.Millisecond
+		deadline := time.Now().Add(maxWait)
+		for time.Now().Before(deadline) {
+			logs, err = ctx.Logs("echo-pod")
+			if err == nil && strings.Contains(logs, "hello from ilmari") {
+				found = true
+				break
+			}
+			time.Sleep(pollInterval)
 		}
-
-		if !strings.Contains(logs, "hello from ilmari") {
-			t.Errorf("expected logs to contain 'hello from ilmari', got: %s", logs)
+		if !found {
+			if err != nil {
+				t.Fatalf("Logs failed: %v", err)
+			} else {
+				t.Errorf("expected logs to contain 'hello from ilmari', got: %s", logs)
+			}
 		}
 	})
 }
