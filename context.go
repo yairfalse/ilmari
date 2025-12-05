@@ -757,6 +757,7 @@ func (pf *PortForward) Close() {
 }
 
 // Get makes an HTTP GET request through the port forward.
+// Caller is responsible for closing the response body.
 func (pf *PortForward) Get(path string) (*http.Response, error) {
 	if pf.err != nil {
 		return nil, pf.err
