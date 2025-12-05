@@ -559,6 +559,15 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 	for {
 		ready, err := c.isReady(kind, name)
 		if err != nil {
+			// Retry on transient errors, only fail on permanent errors
+			if apierrors.IsNotFound(err) || apierrors.IsTooManyRequests(err) {
+				// Transient error, continue polling
+				break
+			}
+			// For network errors, retry if temporary
+			if ne, ok := err.(interface{ Temporary() bool }); ok && ne.Temporary() {
+				break
+			}
 			return err
 		}
 		if ready {
