@@ -2,7 +2,9 @@ package ilmari
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -130,6 +132,424 @@ func TestApplyUpdatesExistingResource(t *testing.T) {
 
 		if got.Data["key"] != "value2" {
 			t.Errorf("expected key=value2, got key=%s", got.Data["key"])
+		}
+	})
+}
+
+// TestWaitReadyPod verifies WaitReady waits for a pod to be ready.
+func TestWaitReadyPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a simple pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-pod",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// WaitReady should succeed once pod is running
+		start := time.Now()
+		err := ctx.WaitReady("pod/test-pod")
+		if err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		t.Logf("Pod became ready in %v", time.Since(start))
+	})
+}
+
+// TestWaitReadyInvalidFormat verifies WaitReady returns error for invalid format.
+func TestWaitReadyInvalidFormat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		err := ctx.WaitReady("invalid-format")
+		if err == nil {
+			t.Error("expected error for invalid format")
+		}
+	})
+}
+
+// TestLogsRetrievesPodOutput verifies Logs returns pod output.
+func TestLogsRetrievesPodOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod that outputs a known string
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "echo-pod",
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "echo 'hello from ilmari' && sleep 10"},
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/echo-pod"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait for logs to contain the expected output, up to a timeout
+		var logs string
+		var err error
+		found := false
+		const maxWait = 5 * time.Second
+		const pollInterval = 100 * time.Millisecond
+		deadline := time.Now().Add(maxWait)
+		for time.Now().Before(deadline) {
+			logs, err = ctx.Logs("echo-pod")
+			if err == nil && strings.Contains(logs, "hello from ilmari") {
+				found = true
+				break
+			}
+			time.Sleep(pollInterval)
+		}
+		if !found {
+			if err != nil {
+				t.Fatalf("Logs failed: %v", err)
+			} else {
+				t.Errorf("expected logs to contain 'hello from ilmari', got: %s", logs)
+			}
+		}
+	})
+}
+
+// TestGetRetrievesResource verifies Get retrieves an existing resource.
+func TestGetRetrievesResource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "get-test",
+			},
+			Data: map[string]string{
+				"foo": "bar",
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Get it back
+		got := &corev1.ConfigMap{}
+		if err := ctx.Get("get-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if got.Data["foo"] != "bar" {
+			t.Errorf("expected foo=bar, got foo=%s", got.Data["foo"])
+		}
+	})
+}
+
+// TestDeleteRemovesResource verifies Delete removes an existing resource.
+func TestDeleteRemovesResource(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "delete-test",
+			},
+			Data: map[string]string{
+				"key": "value",
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Delete it
+		if err := ctx.Delete("delete-test", &corev1.ConfigMap{}); err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+
+		// Verify it's gone
+		got := &corev1.ConfigMap{}
+		err := ctx.Get("delete-test", got)
+		if err == nil {
+			t.Error("expected error getting deleted resource")
+		}
+	})
+}
+
+// TestListReturnsResources verifies List returns resources in namespace.
+func TestListReturnsResources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create two ConfigMaps
+		for _, name := range []string{"list-test-1", "list-test-2"} {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name,
+				},
+			}
+			if err := ctx.Apply(cm); err != nil {
+				t.Fatalf("Apply failed: %v", err)
+			}
+		}
+
+		// List them
+		list := &corev1.ConfigMapList{}
+		if err := ctx.List(list); err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+
+		// Check our ConfigMaps are present (namespace may have default ones)
+		found := 0
+		for _, cm := range list.Items {
+			if cm.Name == "list-test-1" || cm.Name == "list-test-2" {
+				found++
+			}
+		}
+		if found != 2 {
+			t.Errorf("expected to find 2 test ConfigMaps, found %d", found)
+		}
+	})
+}
+
+// TestWaitForCustomCondition verifies WaitFor with custom condition.
+func TestWaitForCustomCondition(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "waitfor-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Wait for pod to have an IP assigned
+		err := ctx.WaitFor("pod/waitfor-test", func(obj interface{}) bool {
+			p, ok := obj.(*corev1.Pod)
+			if !ok {
+				return false
+			}
+			return p.Status.PodIP != ""
+		})
+		if err != nil {
+			t.Fatalf("WaitFor failed: %v", err)
+		}
+
+		// Verify pod has IP
+		got := &corev1.Pod{}
+		if err := ctx.Get("waitfor-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if got.Status.PodIP == "" {
+			t.Error("expected pod to have IP")
+		}
+	})
+}
+
+// TestForwardMakesHTTPRequest verifies Forward can make HTTP requests.
+func TestForwardMakesHTTPRequest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a simple HTTP server pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "http-server",
+				Labels: map[string]string{
+					"app": "http-server",
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "server",
+						Image: "nginx:alpine",
+						Ports: []corev1.ContainerPort{
+							{ContainerPort: 80},
+						},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply pod failed: %v", err)
+		}
+
+		// Create a service
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "http-server",
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{
+					"app": "http-server",
+				},
+				Ports: []corev1.ServicePort{
+					{Port: 80},
+				},
+			},
+		}
+		if err := ctx.Apply(svc); err != nil {
+			t.Fatalf("Apply svc failed: %v", err)
+		}
+
+		// Wait for pod to be ready
+		if err := ctx.WaitReady("pod/http-server"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Forward and make request
+		pf := ctx.Forward("svc/http-server", 80)
+		defer pf.Close()
+
+		resp, err := pf.Get("/")
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			t.Errorf("expected 200, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// TestEventsReturnsNamespaceEvents verifies Events returns events.
+func TestEventsReturnsNamespaceEvents(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod - this generates events
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "events-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Wait for pod to be scheduled (generates events)
+		if err := ctx.WaitReady("pod/events-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Get events
+		events, err := ctx.Events()
+		if err != nil {
+			t.Fatalf("Events failed: %v", err)
+		}
+
+		// Should have at least one event (Scheduled, Pulling, Pulled, Started, etc.)
+		if len(events) == 0 {
+			t.Error("expected at least one event")
+		}
+	})
+}
+
+// TestExecRunsCommand verifies Exec runs a command in a pod.
+func TestExecRunsCommand(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "exec-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "shell",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/exec-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Run a command
+		output, err := ctx.Exec("exec-test", []string{"echo", "hello-exec"})
+		if err != nil {
+			t.Fatalf("Exec failed: %v", err)
+		}
+
+		if !strings.Contains(output, "hello-exec") {
+			t.Errorf("expected output to contain 'hello-exec', got: %s", output)
 		}
 	})
 }
