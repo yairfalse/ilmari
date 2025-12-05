@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
 )
 
@@ -167,11 +168,43 @@ func (c *Context) dumpDiagnostics() {
 	c.t.Logf("\n--- Ilmari Diagnostics ---")
 	c.t.Logf("Namespace: %s (kept for debugging)", c.Namespace)
 
-	// TODO: Dump pod logs
-	// TODO: Dump events
-	// TODO: Dump resource states
+	// Dump pod logs and states
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err == nil {
+		c.t.Logf("\n--- Pods ---")
+		for _, pod := range pods.Items {
+			status := string(pod.Status.Phase)
+			if len(pod.Status.ContainerStatuses) > 0 {
+				cs := pod.Status.ContainerStatuses[0]
+				if cs.State.Waiting != nil {
+					status = cs.State.Waiting.Reason
+				}
+			}
+			c.t.Logf("  %s: %s", pod.Name, status)
 
-	c.t.Logf("--- End Diagnostics ---\n")
+			// Dump logs for non-running pods
+			if pod.Status.Phase != corev1.PodRunning {
+				logs, err := c.Logs(pod.Name)
+				if err == nil && logs != "" {
+					c.t.Logf("  --- Logs (%s) ---", pod.Name)
+					for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+						c.t.Logf("    %s", line)
+					}
+				}
+			}
+		}
+	}
+
+	// Dump events
+	events, err := c.Events()
+	if err == nil && len(events) > 0 {
+		c.t.Logf("\n--- Events ---")
+		for _, ev := range events {
+			c.t.Logf("  %s %s: %s", ev.InvolvedObject.Name, ev.Reason, ev.Message)
+		}
+	}
+
+	c.t.Logf("\n--- End Diagnostics ---")
 }
 
 // Apply creates or updates a resource in the test namespace.
@@ -639,10 +672,51 @@ func (c *Context) Logs(pod string) (string, error) {
 	return buf.String(), nil
 }
 
+// Events returns all events in the test namespace.
+func (c *Context) Events() ([]corev1.Event, error) {
+	list, err := c.Client.CoreV1().Events(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list events: %w", err)
+	}
+	return list.Items, nil
+}
+
 // Exec executes a command in a pod.
 func (c *Context) Exec(pod string, cmd []string) (string, error) {
-	// TODO: Implement
-	return "", fmt.Errorf("Exec not yet implemented")
+	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to get config: %w", err)
+	}
+
+	scheme := runtime.NewScheme()
+	corev1.AddToScheme(scheme)
+
+	req := c.Client.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod).
+		Namespace(c.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: cmd,
+			Stdout:  true,
+			Stderr:  true,
+		}, runtime.NewParameterCodec(scheme))
+
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return "", fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var stdout, stderr strings.Builder
+	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	return stdout.String(), nil
 }
 
 // PortForward represents an active port forward to a pod or service.

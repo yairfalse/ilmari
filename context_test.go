@@ -455,3 +455,89 @@ func TestForwardMakesHTTPRequest(t *testing.T) {
 		}
 	})
 }
+
+// TestEventsReturnsNamespaceEvents verifies Events returns events.
+func TestEventsReturnsNamespaceEvents(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod - this generates events
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "events-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:latest",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Wait for pod to be scheduled (generates events)
+		if err := ctx.WaitReady("pod/events-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Get events
+		events, err := ctx.Events()
+		if err != nil {
+			t.Fatalf("Events failed: %v", err)
+		}
+
+		// Should have at least one event (Scheduled, Pulling, Pulled, Started, etc.)
+		if len(events) == 0 {
+			t.Error("expected at least one event")
+		}
+	})
+}
+
+// TestExecRunsCommand verifies Exec runs a command in a pod.
+func TestExecRunsCommand(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "exec-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "shell",
+						Image:   "busybox:latest",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/exec-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Run a command
+		output, err := ctx.Exec("exec-test", []string{"echo", "hello-exec"})
+		if err != nil {
+			t.Fatalf("Exec failed: %v", err)
+		}
+
+		if !strings.Contains(output, "hello-exec") {
+			t.Errorf("expected output to contain 'hello-exec', got: %s", output)
+		}
+	})
+}
