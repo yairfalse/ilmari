@@ -152,7 +152,7 @@ func TestWaitReadyPod(t *testing.T) {
 				Containers: []corev1.Container{
 					{
 						Name:    "sleep",
-						Image:   "busybox:latest",
+						Image:   "busybox:1.36",
 						Command: []string{"sleep", "300"},
 					},
 				},
@@ -205,7 +205,7 @@ func TestLogsRetrievesPodOutput(t *testing.T) {
 				Containers: []corev1.Container{
 					{
 						Name:    "echo",
-						Image:   "busybox:latest",
+						Image:   "busybox:1.36",
 						Command: []string{"sh", "-c", "echo 'hello from ilmari' && sleep 10"},
 					},
 				},
@@ -354,7 +354,7 @@ func TestWaitForCustomCondition(t *testing.T) {
 				Containers: []corev1.Container{
 					{
 						Name:    "sleep",
-						Image:   "busybox:latest",
+						Image:   "busybox:1.36",
 						Command: []string{"sleep", "300"},
 					},
 				},
@@ -449,6 +449,7 @@ func TestForwardMakesHTTPRequest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
+		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
 			t.Errorf("expected 200, got %d", resp.StatusCode)
@@ -472,7 +473,7 @@ func TestEventsReturnsNamespaceEvents(t *testing.T) {
 				Containers: []corev1.Container{
 					{
 						Name:    "sleep",
-						Image:   "busybox:latest",
+						Image:   "busybox:1.36",
 						Command: []string{"sleep", "300"},
 					},
 				},
@@ -516,7 +517,7 @@ func TestExecRunsCommand(t *testing.T) {
 				Containers: []corev1.Container{
 					{
 						Name:    "shell",
-						Image:   "busybox:latest",
+						Image:   "busybox:1.36",
 						Command: []string{"sleep", "300"},
 					},
 				},

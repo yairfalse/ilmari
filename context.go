@@ -27,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -182,14 +183,12 @@ func (c *Context) dumpDiagnostics() {
 			}
 			c.t.Logf("  %s: %s", pod.Name, status)
 
-			// Dump logs for non-running pods
-			if pod.Status.Phase != corev1.PodRunning {
-				logs, err := c.Logs(pod.Name)
-				if err == nil && logs != "" {
-					c.t.Logf("  --- Logs (%s) ---", pod.Name)
-					for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
-						c.t.Logf("    %s", line)
-					}
+			// Dump logs for all pods
+			logs, err := c.Logs(pod.Name)
+			if err == nil && logs != "" {
+				c.t.Logf("  --- Logs (%s) ---", pod.Name)
+				for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+					c.t.Logf("    %s", line)
 				}
 			}
 		}
@@ -689,7 +688,9 @@ func (c *Context) Exec(pod string, cmd []string) (string, error) {
 	}
 
 	scheme := runtime.NewScheme()
-	corev1.AddToScheme(scheme)
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return "", fmt.Errorf("failed to add scheme: %w", err)
+	}
 
 	req := c.Client.CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -723,14 +724,18 @@ func (c *Context) Exec(pod string, cmd []string) (string, error) {
 type PortForward struct {
 	localPort  int
 	stopChan   chan struct{}
+	doneChan   chan struct{}
 	httpClient *http.Client
 	err        error
 }
 
-// Close closes the port forward.
+// Close closes the port forward and waits for cleanup.
 func (pf *PortForward) Close() {
 	if pf.stopChan != nil {
 		close(pf.stopChan)
+	}
+	if pf.doneChan != nil {
+		<-pf.doneChan
 	}
 }
 
@@ -769,16 +774,8 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 		}
 
 		// Find pods matching the service selector
-		selector := ""
-		for k, v := range svc.Spec.Selector {
-			if selector != "" {
-				selector += ","
-			}
-			selector += k + "=" + v
-		}
-
 		pods, err := c.Client.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: selector,
+			LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		})
 		if err != nil {
 			return &PortForward{err: fmt.Errorf("failed to list pods: %w", err)}
@@ -819,9 +816,11 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 		return &PortForward{err: fmt.Errorf("failed to create port forward: %w", err)}
 	}
 
+	doneChan := make(chan struct{})
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- pf.ForwardPorts()
+		close(doneChan)
 	}()
 
 	// Wait for port forward to be ready
@@ -839,6 +838,7 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 	return &PortForward{
 		localPort:  int(forwardedPorts[0].Local),
 		stopChan:   stopChan,
+		doneChan:   doneChan,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
