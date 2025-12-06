@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
@@ -62,10 +64,11 @@ type Config struct {
 }
 
 // DefaultConfig returns the default configuration.
+// Set ILMARI_KEEP_ALL=true to keep namespaces after all tests.
 func DefaultConfig() Config {
 	return Config{
 		KeepOnFailure: true,
-		KeepAlways:    false,
+		KeepAlways:    os.Getenv("ILMARI_KEEP_ALL") == "true",
 	}
 }
 
@@ -202,6 +205,13 @@ func (c *Context) dumpDiagnostics() {
 			c.t.Logf("  %s %s: %s", ev.InvolvedObject.Name, ev.Reason, ev.Message)
 		}
 	}
+
+	// kubectl hints
+	c.t.Logf("\n--- kubectl commands ---")
+	c.t.Logf("  kubectl get pods -n %s", c.Namespace)
+	c.t.Logf("  kubectl describe pods -n %s", c.Namespace)
+	c.t.Logf("  kubectl logs -n %s <pod-name>", c.Namespace)
+	c.t.Logf("  kubectl get events -n %s", c.Namespace)
 
 	c.t.Logf("\n--- End Diagnostics ---")
 }
@@ -841,4 +851,165 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 		doneChan:   doneChan,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// Stack represents a collection of services to deploy together.
+type Stack struct {
+	services []*ServiceBuilder
+}
+
+// ServiceBuilder builds a service configuration.
+type ServiceBuilder struct {
+	stack    *Stack
+	name     string
+	image    string
+	port     int32
+	replicas int32
+	env      map[string]string
+	command  []string
+}
+
+// NewStack creates a new empty stack.
+func NewStack() *Stack {
+	return &Stack{}
+}
+
+// Service adds a new service to the stack and returns its builder.
+func (s *Stack) Service(name string) *ServiceBuilder {
+	sb := &ServiceBuilder{
+		stack:    s,
+		name:     name,
+		replicas: 1,
+		env:      make(map[string]string),
+	}
+	s.services = append(s.services, sb)
+	return sb
+}
+
+// Image sets the container image.
+func (sb *ServiceBuilder) Image(image string) *ServiceBuilder {
+	sb.image = image
+	return sb
+}
+
+// Port sets the container port.
+func (sb *ServiceBuilder) Port(port int) *ServiceBuilder {
+	sb.port = int32(port)
+	return sb
+}
+
+// Replicas sets the number of replicas.
+func (sb *ServiceBuilder) Replicas(n int) *ServiceBuilder {
+	sb.replicas = int32(n)
+	return sb
+}
+
+// Env adds an environment variable.
+func (sb *ServiceBuilder) Env(key, value string) *ServiceBuilder {
+	sb.env[key] = value
+	return sb
+}
+
+// Command sets the container command.
+func (sb *ServiceBuilder) Command(cmd ...string) *ServiceBuilder {
+	sb.command = cmd
+	return sb
+}
+
+// Service adds another service to the stack (for chaining).
+func (sb *ServiceBuilder) Service(name string) *ServiceBuilder {
+	return sb.stack.Service(name)
+}
+
+// Build returns the stack (for ending the chain).
+func (sb *ServiceBuilder) Build() *Stack {
+	return sb.stack
+}
+
+// Up deploys the stack and waits for all services to be ready.
+func (c *Context) Up(stack *Stack) error {
+	// Deploy all services
+	for _, svc := range stack.services {
+		if err := c.deployService(svc); err != nil {
+			return fmt.Errorf("failed to deploy %s: %w", svc.name, err)
+		}
+	}
+
+	// Wait for all deployments to be ready
+	for _, svc := range stack.services {
+		if err := c.WaitReady("deployment/" + svc.name); err != nil {
+			return fmt.Errorf("failed waiting for %s: %w", svc.name, err)
+		}
+	}
+
+	return nil
+}
+
+// deployService creates a Deployment and Service for the given config.
+func (c *Context) deployService(sb *ServiceBuilder) error {
+	// Build env vars
+	var envVars []corev1.EnvVar
+	for k, v := range sb.env {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+	}
+
+	// Create Deployment
+	replicas := sb.replicas
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: sb.name,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": sb.name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": sb.name},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:    sb.name,
+							Image:   sb.image,
+							Command: sb.command,
+							Env:     envVars,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Add port if specified
+	if sb.port > 0 {
+		deploy.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{
+			{ContainerPort: sb.port},
+		}
+	}
+
+	if err := c.Apply(deploy); err != nil {
+		return err
+	}
+
+	// Create Service if port specified
+	if sb.port > 0 {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: sb.name,
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": sb.name},
+				Ports: []corev1.ServicePort{
+					{Port: sb.port, TargetPort: intstr.FromInt32(sb.port)},
+				},
+			},
+		}
+		if err := c.Apply(svc); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -550,6 +551,60 @@ func TestExecRunsCommand(t *testing.T) {
 
 		if !strings.Contains(output, "hello-exec") {
 			t.Errorf("expected output to contain 'hello-exec', got: %s", output)
+		}
+	})
+}
+
+// TestStackDeploysServices verifies Stack deploys multiple services.
+func TestStackDeploysServices(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Build a stack with two services
+		stack := NewStack().
+			Service("web").Image("nginx:alpine").Port(80).
+			Service("worker").Image("busybox:1.36").Command("sleep", "300").
+			Build()
+
+		// Deploy and wait
+		if err := ctx.Up(stack); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		// Verify both deployments exist
+		webDeploy := &appsv1.Deployment{}
+		if err := ctx.Get("web", webDeploy); err != nil {
+			t.Fatalf("Get web deployment failed: %v", err)
+		}
+		if *webDeploy.Spec.Replicas != 1 {
+			t.Errorf("expected 1 replica, got %d", *webDeploy.Spec.Replicas)
+		}
+
+		workerDeploy := &appsv1.Deployment{}
+		if err := ctx.Get("worker", workerDeploy); err != nil {
+			t.Fatalf("Get worker deployment failed: %v", err)
+		}
+
+		// Verify web service exists (worker has no port, so no service)
+		webSvc := &corev1.Service{}
+		if err := ctx.Get("web", webSvc); err != nil {
+			t.Fatalf("Get web service failed: %v", err)
+		}
+
+		// Test port forward to web service
+		pf := ctx.Forward("svc/web", 80)
+		defer pf.Close()
+
+		resp, err := pf.Get("/")
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			t.Errorf("expected 200, got %d", resp.StatusCode)
 		}
 	})
 }
