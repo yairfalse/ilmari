@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,16 +28,22 @@ import (
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
+	"sigs.k8s.io/yaml"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -48,6 +55,9 @@ import (
 type Context struct {
 	// Client is the Kubernetes clientset
 	Client *kubernetes.Clientset
+
+	// Dynamic is the dynamic client for CRDs and unstructured resources
+	Dynamic dynamic.Interface
 
 	// Namespace is the isolated test namespace
 	Namespace string
@@ -136,6 +146,12 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
+	// Create dynamic client for CRDs
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
 	// Generate unique namespace
 	id := uuid.New().String()[:8]
 	namespace := fmt.Sprintf("ilmari-test-%s", id)
@@ -167,6 +183,7 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 
 	return &Context{
 		Client:    client,
+		Dynamic:   dynamicClient,
 		Namespace: namespace,
 		t:         t,
 		tracer:    tracer,
@@ -1029,13 +1046,14 @@ type Stack struct {
 
 // ServiceBuilder builds a service configuration.
 type ServiceBuilder struct {
-	stack    *Stack
-	name     string
-	image    string
-	port     int32
-	replicas int32
-	env      map[string]string
-	command  []string
+	stack          *Stack
+	name           string
+	image          string
+	port           int32
+	replicas       int32
+	env            map[string]string
+	command        []string
+	resourceLimits corev1.ResourceList
 }
 
 // NewStack creates a new empty stack.
@@ -1170,6 +1188,14 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 		}
 	}
 
+	// Add resource limits if specified
+	if sb.resourceLimits != nil {
+		deploy.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+			Limits:   sb.resourceLimits,
+			Requests: sb.resourceLimits,
+		}
+	}
+
 	if err := c.Apply(deploy); err != nil {
 		return err
 	}
@@ -1193,4 +1219,521 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 	}
 
 	return nil
+}
+
+// Retry executes fn up to maxAttempts times with exponential backoff.
+// Returns nil on first success, or the last error after all attempts fail.
+func (c *Context) Retry(maxAttempts int, fn func() error) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Retry",
+		attribute.Int("max_attempts", maxAttempts))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	backoff := 100 * time.Millisecond
+	for i := 0; i < maxAttempts; i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if i < maxAttempts-1 {
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > 5*time.Second {
+				backoff = 5 * time.Second
+			}
+		}
+	}
+	return err
+}
+
+// Kill deletes a pod, useful for chaos testing.
+// Resource format: "pod/name" or just "name" (assumes pod)
+func (c *Context) Kill(resource string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Kill",
+		attribute.String("resource", resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Parse resource
+	var podName string
+	if strings.Contains(resource, "/") {
+		parts := strings.SplitN(resource, "/", 2)
+		if strings.ToLower(parts[0]) != "pod" {
+			err = fmt.Errorf("Kill only supports pods, got %s", parts[0])
+			return err
+		}
+		podName = parts[1]
+	} else {
+		podName = resource
+	}
+
+	// Delete with zero grace period for immediate termination
+	grace := int64(0)
+	err = c.Client.CoreV1().Pods(c.Namespace).Delete(
+		context.Background(),
+		podName,
+		metav1.DeleteOptions{GracePeriodSeconds: &grace},
+	)
+	return err
+}
+
+// LoadYAML loads and applies a YAML file from the given path.
+// Supports single or multi-document YAML files.
+func (c *Context) LoadYAML(path string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.LoadYAML",
+		attribute.String("path", path))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+
+	return c.applyYAML(data)
+}
+
+// LoadYAMLDir loads and applies all YAML files from a directory.
+func (c *Context) LoadYAMLDir(dir string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.LoadYAMLDir",
+		attribute.String("dir", dir))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
+			if err := c.LoadYAML(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// applyYAML parses and applies YAML content.
+func (c *Context) applyYAML(data []byte) error {
+	// Split multi-document YAML
+	docs := strings.Split(string(data), "\n---")
+	for _, doc := range docs {
+		doc = strings.TrimSpace(doc)
+		if doc == "" || doc == "---" {
+			continue
+		}
+
+		// Parse to unstructured to determine type
+		var obj unstructured.Unstructured
+		if err := yaml.Unmarshal([]byte(doc), &obj.Object); err != nil {
+			return fmt.Errorf("failed to parse YAML: %w", err)
+		}
+
+		if len(obj.Object) == 0 {
+			continue
+		}
+
+		// Try to apply as typed resource first
+		if err := c.applyTypedYAML([]byte(doc), obj.GetKind()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyTypedYAML applies YAML as a typed resource.
+func (c *Context) applyTypedYAML(data []byte, kind string) error {
+	switch kind {
+	case "ConfigMap":
+		var obj corev1.ConfigMap
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Secret":
+		var obj corev1.Secret
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Service":
+		var obj corev1.Service
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Pod":
+		var obj corev1.Pod
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Deployment":
+		var obj appsv1.Deployment
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "StatefulSet":
+		var obj appsv1.StatefulSet
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "DaemonSet":
+		var obj appsv1.DaemonSet
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	default:
+		return fmt.Errorf("unsupported kind in YAML: %s", kind)
+	}
+}
+
+// Assert returns an assertion builder for the given resource.
+// Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
+func (c *Context) Assert(resource string) *Assertion {
+	return &Assertion{
+		ctx:      c,
+		resource: resource,
+	}
+}
+
+// Assertion provides fluent assertions for Kubernetes resources.
+type Assertion struct {
+	ctx      *Context
+	resource string
+	err      error
+}
+
+// HasLabel asserts the resource has the given label with value.
+func (a *Assertion) HasLabel(key, value string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if obj == nil {
+		a.err = fmt.Errorf("resource %s not found", a.resource)
+		return a
+	}
+
+	// Get labels from the object
+	var labels map[string]string
+	switch o := obj.(type) {
+	case *corev1.Pod:
+		labels = o.Labels
+	case *corev1.ConfigMap:
+		labels = o.Labels
+	case *corev1.Secret:
+		labels = o.Labels
+	case *corev1.Service:
+		labels = o.Labels
+	case *appsv1.Deployment:
+		labels = o.Labels
+	case *appsv1.StatefulSet:
+		labels = o.Labels
+	case *appsv1.DaemonSet:
+		labels = o.Labels
+	}
+
+	if labels[key] != value {
+		a.err = fmt.Errorf("expected label %s=%s, got %s=%s", key, value, key, labels[key])
+	}
+	return a
+}
+
+// HasAnnotation asserts the resource has the given annotation.
+func (a *Assertion) HasAnnotation(key, value string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if obj == nil {
+		a.err = fmt.Errorf("resource %s not found", a.resource)
+		return a
+	}
+
+	var annotations map[string]string
+	switch o := obj.(type) {
+	case *corev1.Pod:
+		annotations = o.Annotations
+	case *corev1.ConfigMap:
+		annotations = o.Annotations
+	case *corev1.Secret:
+		annotations = o.Annotations
+	case *corev1.Service:
+		annotations = o.Annotations
+	case *appsv1.Deployment:
+		annotations = o.Annotations
+	case *appsv1.StatefulSet:
+		annotations = o.Annotations
+	case *appsv1.DaemonSet:
+		annotations = o.Annotations
+	}
+
+	if annotations[key] != value {
+		a.err = fmt.Errorf("expected annotation %s=%s, got %s=%s", key, value, key, annotations[key])
+	}
+	return a
+}
+
+// IsReady asserts the resource is ready.
+func (a *Assertion) IsReady() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	ready, err := a.ctx.isReady(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if !ready {
+		a.err = fmt.Errorf("resource %s is not ready", a.resource)
+	}
+	return a
+}
+
+// Exists asserts the resource exists.
+func (a *Assertion) Exists() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if obj == nil {
+		a.err = fmt.Errorf("resource %s does not exist", a.resource)
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *Assertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+func (a *Assertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ApplyCRD applies a custom resource using the dynamic client.
+func (c *Context) ApplyCRD(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.ApplyCRD",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", obj.GetName()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	obj.SetNamespace(c.Namespace)
+	ctx := context.Background()
+
+	_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, obj, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+	}
+	return err
+}
+
+// GetCRD retrieves a custom resource.
+func (c *Context) GetCRD(gvr schema.GroupVersionResource, name string) (*unstructured.Unstructured, error) {
+	_, span := c.startSpan(context.Background(), "ilmari.GetCRD",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	var err error
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	result, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	return result, err
+}
+
+// DeleteCRD deletes a custom resource.
+func (c *Context) DeleteCRD(gvr schema.GroupVersionResource, name string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.DeleteCRD",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	return c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+}
+
+// Isolate creates a NetworkPolicy that blocks all ingress/egress traffic.
+// Useful for testing network isolation.
+func (c *Context) Isolate(podSelector map[string]string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Isolate")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ilmari-isolate",
+			Namespace: c.Namespace,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: podSelector,
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			// Empty ingress/egress = deny all
+			Ingress: []networkingv1.NetworkPolicyIngressRule{},
+			Egress:  []networkingv1.NetworkPolicyEgressRule{},
+		},
+	}
+
+	_, err = c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Create(
+		context.Background(), policy, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		_, err = c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Update(
+			context.Background(), policy, metav1.UpdateOptions{})
+	}
+	return err
+}
+
+// AllowFrom creates a NetworkPolicy allowing traffic from specific pods.
+func (c *Context) AllowFrom(targetSelector, sourceSelector map[string]string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.AllowFrom")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("ilmari-allow-%s", uuid.New().String()[:8]),
+			Namespace: c.Namespace,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: targetSelector,
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: []networkingv1.NetworkPolicyPeer{
+						{
+							PodSelector: &metav1.LabelSelector{
+								MatchLabels: sourceSelector,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err = c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Create(
+		context.Background(), policy, metav1.CreateOptions{})
+	return err
+}
+
+// Resources sets resource limits/requests for the ServiceBuilder.
+func (sb *ServiceBuilder) Resources(cpu, memory string) *ServiceBuilder {
+	sb.resourceLimits = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+	}
+	return sb
 }
