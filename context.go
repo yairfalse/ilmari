@@ -37,6 +37,11 @@ import (
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Context provides a Kubernetes connection with an isolated namespace for testing.
@@ -49,6 +54,9 @@ type Context struct {
 
 	// t is the test instance for logging
 	t *testing.T
+
+	// tracer for OpenTelemetry tracing (optional)
+	tracer trace.Tracer
 }
 
 // Config configures the test context behavior.
@@ -61,6 +69,9 @@ type Config struct {
 
 	// Kubeconfig path (default: uses KUBECONFIG or ~/.kube/config)
 	Kubeconfig string
+
+	// TracerProvider for OpenTelemetry tracing (optional)
+	TracerProvider trace.TracerProvider
 }
 
 // DefaultConfig returns the default configuration.
@@ -146,11 +157,26 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 
 	t.Logf("Created test namespace: %s", namespace)
 
+	// Initialize tracer if configured
+	var tracer trace.Tracer
+	if cfg.TracerProvider != nil {
+		tracer = cfg.TracerProvider.Tracer("ilmari")
+	} else {
+		tracer = otel.Tracer("ilmari")
+	}
+
 	return &Context{
 		Client:    client,
 		Namespace: namespace,
 		t:         t,
+		tracer:    tracer,
 	}, nil
+}
+
+// startSpan starts a new span for tracing.
+func (c *Context) startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	attrs = append(attrs, attribute.String("namespace", c.Namespace))
+	return c.tracer.Start(ctx, name, trace.WithAttributes(attrs...))
 }
 
 // cleanup deletes the test namespace.
@@ -217,14 +243,23 @@ func (c *Context) dumpDiagnostics() {
 }
 
 // Apply creates or updates a resource in the test namespace.
-func (c *Context) Apply(obj runtime.Object) error {
-	ctx := context.Background()
+func (c *Context) Apply(obj runtime.Object) (err error) {
+	kind := fmt.Sprintf("%T", obj)
+	ctx, span := c.startSpan(context.Background(), "ilmari.Apply",
+		attribute.String("resource.kind", kind))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
 
 	switch o := obj.(type) {
 	case *corev1.ConfigMap:
 		cm := o.DeepCopy()
 		cm.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, cm, metav1.CreateOptions{})
+		_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, cm, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
 		}
@@ -233,7 +268,7 @@ func (c *Context) Apply(obj runtime.Object) error {
 	case *corev1.Secret:
 		secret := o.DeepCopy()
 		secret.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, secret, metav1.CreateOptions{})
+		_, err = c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, secret, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.CoreV1().Secrets(c.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
 		}
@@ -242,7 +277,7 @@ func (c *Context) Apply(obj runtime.Object) error {
 	case *corev1.Service:
 		svc := o.DeepCopy()
 		svc.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Services(c.Namespace).Create(ctx, svc, metav1.CreateOptions{})
+		_, err = c.Client.CoreV1().Services(c.Namespace).Create(ctx, svc, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.CoreV1().Services(c.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
 		}
@@ -251,7 +286,7 @@ func (c *Context) Apply(obj runtime.Object) error {
 	case *corev1.Pod:
 		pod := o.DeepCopy()
 		pod.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+		_, err = c.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.CoreV1().Pods(c.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
 		}
@@ -260,7 +295,7 @@ func (c *Context) Apply(obj runtime.Object) error {
 	case *appsv1.Deployment:
 		deploy := o.DeepCopy()
 		deploy.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, deploy, metav1.CreateOptions{})
+		_, err = c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, deploy, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.AppsV1().Deployments(c.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
 		}
@@ -269,7 +304,7 @@ func (c *Context) Apply(obj runtime.Object) error {
 	case *appsv1.StatefulSet:
 		ss := o.DeepCopy()
 		ss.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, ss, metav1.CreateOptions{})
+		_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, ss, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Update(ctx, ss, metav1.UpdateOptions{})
 		}
@@ -278,24 +313,36 @@ func (c *Context) Apply(obj runtime.Object) error {
 	case *appsv1.DaemonSet:
 		ds := o.DeepCopy()
 		ds.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, ds, metav1.CreateOptions{})
+		_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, ds, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Update(ctx, ds, metav1.UpdateOptions{})
 		}
 		return err
 
 	default:
-		return fmt.Errorf("unsupported type: %T", obj)
+		err = fmt.Errorf("unsupported type: %T", obj)
+		return err
 	}
 }
 
 // Get retrieves a resource from the test namespace.
-func (c *Context) Get(name string, obj runtime.Object) error {
-	ctx := context.Background()
+func (c *Context) Get(name string, obj runtime.Object) (err error) {
+	kind := fmt.Sprintf("%T", obj)
+	ctx, span := c.startSpan(context.Background(), "ilmari.Get",
+		attribute.String("resource.kind", kind),
+		attribute.String("resource.name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
 
 	switch o := obj.(type) {
 	case *corev1.ConfigMap:
-		got, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *corev1.ConfigMap
+		got, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -303,7 +350,8 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	case *corev1.Secret:
-		got, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *corev1.Secret
+		got, err = c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -311,7 +359,8 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	case *corev1.Service:
-		got, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *corev1.Service
+		got, err = c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -319,7 +368,8 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	case *corev1.Pod:
-		got, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *corev1.Pod
+		got, err = c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -327,7 +377,8 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	case *appsv1.Deployment:
-		got, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *appsv1.Deployment
+		got, err = c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -335,7 +386,8 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	case *appsv1.StatefulSet:
-		got, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *appsv1.StatefulSet
+		got, err = c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -343,7 +395,8 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	case *appsv1.DaemonSet:
-		got, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		var got *appsv1.DaemonSet
+		got, err = c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -351,42 +404,65 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		return nil
 
 	default:
-		return fmt.Errorf("unsupported type: %T", obj)
+		err = fmt.Errorf("unsupported type: %T", obj)
+		return err
 	}
 }
 
 // Delete removes a resource from the test namespace.
-func (c *Context) Delete(name string, obj runtime.Object) error {
-	ctx := context.Background()
+func (c *Context) Delete(name string, obj runtime.Object) (err error) {
+	kind := fmt.Sprintf("%T", obj)
+	ctx, span := c.startSpan(context.Background(), "ilmari.Delete",
+		attribute.String("resource.kind", kind),
+		attribute.String("resource.name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
 
 	switch obj.(type) {
 	case *corev1.ConfigMap:
-		return c.Client.CoreV1().ConfigMaps(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.CoreV1().ConfigMaps(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	case *corev1.Secret:
-		return c.Client.CoreV1().Secrets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.CoreV1().Secrets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	case *corev1.Service:
-		return c.Client.CoreV1().Services(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.CoreV1().Services(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	case *corev1.Pod:
-		return c.Client.CoreV1().Pods(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.CoreV1().Pods(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	case *appsv1.Deployment:
-		return c.Client.AppsV1().Deployments(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.AppsV1().Deployments(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	case *appsv1.StatefulSet:
-		return c.Client.AppsV1().StatefulSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.AppsV1().StatefulSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	case *appsv1.DaemonSet:
-		return c.Client.AppsV1().DaemonSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
+		err = c.Client.AppsV1().DaemonSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	default:
-		return fmt.Errorf("unsupported type: %T", obj)
+		err = fmt.Errorf("unsupported type: %T", obj)
 	}
+	return err
 }
 
 // List retrieves all resources of a type from the test namespace.
-func (c *Context) List(list runtime.Object) error {
-	ctx := context.Background()
+func (c *Context) List(list runtime.Object) (err error) {
+	kind := fmt.Sprintf("%T", list)
+	ctx, span := c.startSpan(context.Background(), "ilmari.List",
+		attribute.String("resource.kind", kind))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	opts := metav1.ListOptions{}
 
 	switch l := list.(type) {
 	case *corev1.ConfigMapList:
-		got, err := c.Client.CoreV1().ConfigMaps(c.Namespace).List(ctx, opts)
+		var got *corev1.ConfigMapList
+		got, err = c.Client.CoreV1().ConfigMaps(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -394,7 +470,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	case *corev1.SecretList:
-		got, err := c.Client.CoreV1().Secrets(c.Namespace).List(ctx, opts)
+		var got *corev1.SecretList
+		got, err = c.Client.CoreV1().Secrets(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -402,7 +479,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	case *corev1.ServiceList:
-		got, err := c.Client.CoreV1().Services(c.Namespace).List(ctx, opts)
+		var got *corev1.ServiceList
+		got, err = c.Client.CoreV1().Services(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -410,7 +488,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	case *corev1.PodList:
-		got, err := c.Client.CoreV1().Pods(c.Namespace).List(ctx, opts)
+		var got *corev1.PodList
+		got, err = c.Client.CoreV1().Pods(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -418,7 +497,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	case *appsv1.DeploymentList:
-		got, err := c.Client.AppsV1().Deployments(c.Namespace).List(ctx, opts)
+		var got *appsv1.DeploymentList
+		got, err = c.Client.AppsV1().Deployments(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -426,7 +506,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	case *appsv1.StatefulSetList:
-		got, err := c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, opts)
+		var got *appsv1.StatefulSetList
+		got, err = c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -434,7 +515,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	case *appsv1.DaemonSetList:
-		got, err := c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, opts)
+		var got *appsv1.DaemonSetList
+		got, err = c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, opts)
 		if err != nil {
 			return err
 		}
@@ -442,7 +524,8 @@ func (c *Context) List(list runtime.Object) error {
 		return nil
 
 	default:
-		return fmt.Errorf("unsupported type: %T", list)
+		err = fmt.Errorf("unsupported type: %T", list)
+		return err
 	}
 }
 
@@ -459,10 +542,22 @@ func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool)
 }
 
 // WaitForTimeout waits for a custom condition with timeout.
-func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) error {
+func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitFor",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -475,8 +570,9 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	defer ticker.Stop()
 
 	for {
-		obj, err := c.getResource(kind, name)
-		if err != nil {
+		obj, getErr := c.getResource(kind, name)
+		if getErr != nil {
+			err = getErr
 			return err
 		}
 		if obj != nil && condition(obj) {
@@ -485,7 +581,8 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for %s", resource)
+			err = fmt.Errorf("timeout waiting for %s", resource)
+			return err
 		case <-ticker.C:
 		}
 	}
@@ -551,10 +648,22 @@ func (c *Context) getResource(kind, name string) (interface{}, error) {
 }
 
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
-func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
+func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitReady",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -567,7 +676,8 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 	defer ticker.Stop()
 
 	for {
-		ready, err := c.isReady(kind, name)
+		var ready bool
+		ready, err = c.isReady(kind, name)
 		if err != nil {
 			return err
 		}
@@ -577,7 +687,8 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for %s to be ready", resource)
+			err = fmt.Errorf("timeout waiting for %s to be ready", resource)
+			return err
 		case <-ticker.C:
 		}
 	}
@@ -665,40 +776,75 @@ func isDaemonSetReady(ds *appsv1.DaemonSet) bool {
 }
 
 // Logs retrieves logs from a pod.
-func (c *Context) Logs(pod string) (string, error) {
+func (c *Context) Logs(pod string) (result string, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Logs",
+		attribute.String("pod", pod))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{})
 	stream, err := req.Stream(context.Background())
 	if err != nil {
-		return "", fmt.Errorf("failed to get logs: %w", err)
+		err = fmt.Errorf("failed to get logs: %w", err)
+		return "", err
 	}
 	defer stream.Close()
 
 	buf := new(strings.Builder)
-	if _, err := io.Copy(buf, stream); err != nil {
-		return "", fmt.Errorf("failed to read logs: %w", err)
+	if _, err = io.Copy(buf, stream); err != nil {
+		err = fmt.Errorf("failed to read logs: %w", err)
+		return "", err
 	}
 	return buf.String(), nil
 }
 
 // Events returns all events in the test namespace.
-func (c *Context) Events() ([]corev1.Event, error) {
+func (c *Context) Events() (events []corev1.Event, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Events")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	list, err := c.Client.CoreV1().Events(c.Namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list events: %w", err)
+		err = fmt.Errorf("failed to list events: %w", err)
+		return nil, err
 	}
 	return list.Items, nil
 }
 
 // Exec executes a command in a pod.
-func (c *Context) Exec(pod string, cmd []string) (string, error) {
+func (c *Context) Exec(pod string, cmd []string) (result string, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Exec",
+		attribute.String("pod", pod),
+		attribute.StringSlice("command", cmd))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		return "", fmt.Errorf("failed to get config: %w", err)
+		err = fmt.Errorf("failed to get config: %w", err)
+		return "", err
 	}
 
 	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		return "", fmt.Errorf("failed to add scheme: %w", err)
+	if err = corev1.AddToScheme(scheme); err != nil {
+		err = fmt.Errorf("failed to add scheme: %w", err)
+		return "", err
 	}
 
 	req := c.Client.CoreV1().RESTClient().Post().
@@ -712,18 +858,20 @@ func (c *Context) Exec(pod string, cmd []string) (string, error) {
 			Stderr:  true,
 		}, runtime.NewParameterCodec(scheme))
 
-	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
-		return "", fmt.Errorf("failed to create executor: %w", err)
+		err = fmt.Errorf("failed to create executor: %w", err)
+		return "", err
 	}
 
 	var stdout, stderr strings.Builder
-	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
 		Stdout: &stdout,
 		Stderr: &stderr,
 	})
 	if err != nil {
-		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+		err = fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+		return "", err
 	}
 
 	return stdout.String(), nil
@@ -736,6 +884,7 @@ type PortForward struct {
 	doneChan   chan struct{}
 	httpClient *http.Client
 	err        error
+	span       trace.Span
 }
 
 // Close closes the port forward and waits for cleanup.
@@ -745,6 +894,9 @@ func (pf *PortForward) Close() {
 	}
 	if pf.doneChan != nil {
 		<-pf.doneChan
+	}
+	if pf.span != nil {
+		pf.span.End()
 	}
 }
 
@@ -761,13 +913,28 @@ func (pf *PortForward) Get(path string) (*http.Response, error) {
 // Forward creates a port forward to a pod or service.
 // Resource format: "svc/name" or "pod/name"
 func (c *Context) Forward(resource string, port int) *PortForward {
+	_, span := c.startSpan(context.Background(), "ilmari.Forward",
+		attribute.String("resource", resource),
+		attribute.Int("port", port))
+
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
+		span.RecordError(fmt.Errorf("invalid resource format"))
+		span.SetStatus(codes.Error, "invalid resource format")
+		span.End()
 		return &PortForward{err: fmt.Errorf("invalid resource format %q, expected kind/name", resource)}
 	}
 
 	kind := strings.ToLower(parts[0])
 	name := parts[1]
+
+	// Helper to return error with span handling
+	returnErr := func(err error) *PortForward {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
+		return &PortForward{err: err}
+	}
 
 	// Get pod name
 	var podName string
@@ -780,7 +947,7 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 		// Get service and find a pod
 		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return &PortForward{err: fmt.Errorf("failed to get service: %w", err)}
+			return returnErr(fmt.Errorf("failed to get service: %w", err))
 		}
 
 		// Find pods matching the service selector
@@ -788,25 +955,25 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 			LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		})
 		if err != nil {
-			return &PortForward{err: fmt.Errorf("failed to list pods: %w", err)}
+			return returnErr(fmt.Errorf("failed to list pods: %w", err))
 		}
 		if len(pods.Items) == 0 {
-			return &PortForward{err: fmt.Errorf("no pods found for service %s", name)}
+			return returnErr(fmt.Errorf("no pods found for service %s", name))
 		}
 		podName = pods.Items[0].Name
 	default:
-		return &PortForward{err: fmt.Errorf("unsupported kind %q, use pod or svc", kind)}
+		return returnErr(fmt.Errorf("unsupported kind %q, use pod or svc", kind))
 	}
 
 	// Set up port forward
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to get config: %w", err)}
+		return returnErr(fmt.Errorf("failed to get config: %w", err))
 	}
 
 	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to create round tripper: %w", err)}
+		return returnErr(fmt.Errorf("failed to create round tripper: %w", err))
 	}
 
 	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", c.Namespace, podName)
@@ -823,7 +990,7 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 	ports := []string{fmt.Sprintf("0:%d", port)}
 	pf, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to create port forward: %w", err)}
+		return returnErr(fmt.Errorf("failed to create port forward: %w", err))
 	}
 
 	doneChan := make(chan struct{})
@@ -837,19 +1004,21 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 	select {
 	case <-readyChan:
 	case err := <-errChan:
-		return &PortForward{err: fmt.Errorf("port forward failed: %w", err)}
+		return returnErr(fmt.Errorf("port forward failed: %w", err))
 	}
 
 	forwardedPorts, err := pf.GetPorts()
 	if err != nil || len(forwardedPorts) == 0 {
-		return &PortForward{err: fmt.Errorf("failed to get forwarded ports: %w", err)}
+		return returnErr(fmt.Errorf("failed to get forwarded ports: %w", err))
 	}
 
+	// Return with span - it will be closed in PortForward.Close()
 	return &PortForward{
 		localPort:  int(forwardedPorts[0].Local),
 		stopChan:   stopChan,
 		doneChan:   doneChan,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		span:       span,
 	}
 }
 
@@ -927,18 +1096,30 @@ func (sb *ServiceBuilder) Build() *Stack {
 }
 
 // Up deploys the stack and waits for all services to be ready.
-func (c *Context) Up(stack *Stack) error {
+func (c *Context) Up(stack *Stack) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Up",
+		attribute.Int("service_count", len(stack.services)))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	// Deploy all services
 	for _, svc := range stack.services {
-		if err := c.deployService(svc); err != nil {
-			return fmt.Errorf("failed to deploy %s: %w", svc.name, err)
+		if err = c.deployService(svc); err != nil {
+			err = fmt.Errorf("failed to deploy %s: %w", svc.name, err)
+			return err
 		}
 	}
 
 	// Wait for all deployments to be ready
 	for _, svc := range stack.services {
-		if err := c.WaitReady("deployment/" + svc.name); err != nil {
-			return fmt.Errorf("failed waiting for %s: %w", svc.name, err)
+		if err = c.WaitReady("deployment/" + svc.name); err != nil {
+			err = fmt.Errorf("failed waiting for %s: %w", svc.name, err)
+			return err
 		}
 	}
 
