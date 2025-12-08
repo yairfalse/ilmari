@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,16 +28,29 @@ import (
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
+	"sigs.k8s.io/yaml"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Context provides a Kubernetes connection with an isolated namespace for testing.
@@ -44,11 +58,20 @@ type Context struct {
 	// Client is the Kubernetes clientset
 	Client *kubernetes.Clientset
 
+	// Dynamic is the dynamic client for CRDs and unstructured resources
+	Dynamic dynamic.Interface
+
 	// Namespace is the isolated test namespace
 	Namespace string
 
 	// t is the test instance for logging
 	t *testing.T
+
+	// tracer for OpenTelemetry tracing (optional)
+	tracer trace.Tracer
+
+	// mapper for GVK to GVR discovery
+	mapper *restmapper.DeferredDiscoveryRESTMapper
 }
 
 // Config configures the test context behavior.
@@ -61,6 +84,9 @@ type Config struct {
 
 	// Kubeconfig path (default: uses KUBECONFIG or ~/.kube/config)
 	Kubeconfig string
+
+	// TracerProvider for OpenTelemetry tracing (optional)
+	TracerProvider trace.TracerProvider
 }
 
 // DefaultConfig returns the default configuration.
@@ -125,6 +151,21 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
+	// Create dynamic client for CRDs
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Create discovery client and REST mapper
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(
+		&cachedDiscovery{DiscoveryInterface: discoveryClient},
+	)
+
 	// Generate unique namespace
 	id := uuid.New().String()[:8]
 	namespace := fmt.Sprintf("ilmari-test-%s", id)
@@ -146,11 +187,77 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 
 	t.Logf("Created test namespace: %s", namespace)
 
+	// Initialize tracer if configured
+	var tracer trace.Tracer
+	if cfg.TracerProvider != nil {
+		tracer = cfg.TracerProvider.Tracer("ilmari")
+	} else {
+		tracer = otel.Tracer("ilmari")
+	}
+
 	return &Context{
 		Client:    client,
+		Dynamic:   dynamicClient,
 		Namespace: namespace,
 		t:         t,
+		tracer:    tracer,
+		mapper:    mapper,
 	}, nil
+}
+
+// cachedDiscovery wraps DiscoveryInterface with a simple in-memory cache.
+type cachedDiscovery struct {
+	discovery.DiscoveryInterface
+}
+
+func (c *cachedDiscovery) Fresh() bool {
+	return true
+}
+
+func (c *cachedDiscovery) Invalidate() {}
+
+// scheme for converting typed objects to unstructured
+var scheme = runtime.NewScheme()
+
+func init() {
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+}
+
+// toUnstructured converts a typed object to unstructured.
+func toUnstructured(obj runtime.Object) (*unstructured.Unstructured, error) {
+	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return nil, err
+	}
+	u := &unstructured.Unstructured{Object: content}
+	return u, nil
+}
+
+// getGVR returns the GroupVersionResource for the given object.
+func (c *Context) getGVR(obj runtime.Object) (schema.GroupVersionResource, error) {
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	if gvk.Empty() {
+		// Try to get GVK from scheme
+		gvks, _, err := scheme.ObjectKinds(obj)
+		if err != nil || len(gvks) == 0 {
+			return schema.GroupVersionResource{}, fmt.Errorf("cannot determine GVK for %T", obj)
+		}
+		gvk = gvks[0]
+	}
+
+	mapping, err := c.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("failed to get REST mapping: %w", err)
+	}
+	return mapping.Resource, nil
+}
+
+// startSpan starts a new span for tracing.
+func (c *Context) startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	attrs = append(attrs, attribute.String("namespace", c.Namespace))
+	return c.tracer.Start(ctx, name, trace.WithAttributes(attrs...))
 }
 
 // cleanup deletes the test namespace.
@@ -217,233 +324,120 @@ func (c *Context) dumpDiagnostics() {
 }
 
 // Apply creates or updates a resource in the test namespace.
-func (c *Context) Apply(obj runtime.Object) error {
-	ctx := context.Background()
-
-	switch o := obj.(type) {
-	case *corev1.ConfigMap:
-		cm := o.DeepCopy()
-		cm.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Create(ctx, cm, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
-		}
+// Works with any resource type including CRDs.
+func (c *Context) Apply(obj runtime.Object) (err error) {
+	gvr, err := c.getGVR(obj)
+	if err != nil {
 		return err
-
-	case *corev1.Secret:
-		secret := o.DeepCopy()
-		secret.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Secrets(c.Namespace).Create(ctx, secret, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.CoreV1().Secrets(c.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
-		}
-		return err
-
-	case *corev1.Service:
-		svc := o.DeepCopy()
-		svc.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Services(c.Namespace).Create(ctx, svc, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.CoreV1().Services(c.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
-		}
-		return err
-
-	case *corev1.Pod:
-		pod := o.DeepCopy()
-		pod.Namespace = c.Namespace
-		_, err := c.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.CoreV1().Pods(c.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
-		}
-		return err
-
-	case *appsv1.Deployment:
-		deploy := o.DeepCopy()
-		deploy.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().Deployments(c.Namespace).Create(ctx, deploy, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.AppsV1().Deployments(c.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
-		}
-		return err
-
-	case *appsv1.StatefulSet:
-		ss := o.DeepCopy()
-		ss.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Create(ctx, ss, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Update(ctx, ss, metav1.UpdateOptions{})
-		}
-		return err
-
-	case *appsv1.DaemonSet:
-		ds := o.DeepCopy()
-		ds.Namespace = c.Namespace
-		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Create(ctx, ds, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Update(ctx, ds, metav1.UpdateOptions{})
-		}
-		return err
-
-	default:
-		return fmt.Errorf("unsupported type: %T", obj)
 	}
+
+	_, span := c.startSpan(context.Background(), "ilmari.Apply",
+		attribute.String("resource", gvr.Resource),
+		attribute.String("group", gvr.Group))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Convert to unstructured
+	u, err := toUnstructured(obj)
+	if err != nil {
+		return fmt.Errorf("failed to convert to unstructured: %w", err)
+	}
+	u.SetNamespace(c.Namespace)
+
+	ctx := context.Background()
+	_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, u, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		// Get existing to preserve resourceVersion
+		existing, getErr := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(ctx, u.GetName(), metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		u.SetResourceVersion(existing.GetResourceVersion())
+		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, u, metav1.UpdateOptions{})
+	}
+	return err
 }
 
 // Get retrieves a resource from the test namespace.
-func (c *Context) Get(name string, obj runtime.Object) error {
-	ctx := context.Background()
-
-	switch o := obj.(type) {
-	case *corev1.ConfigMap:
-		got, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	case *corev1.Secret:
-		got, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	case *corev1.Service:
-		got, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	case *corev1.Pod:
-		got, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	case *appsv1.Deployment:
-		got, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	case *appsv1.StatefulSet:
-		got, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	case *appsv1.DaemonSet:
-		got, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		*o = *got
-		return nil
-
-	default:
-		return fmt.Errorf("unsupported type: %T", obj)
+// Works with any resource type including CRDs.
+func (c *Context) Get(name string, obj runtime.Object) (err error) {
+	gvr, err := c.getGVR(obj)
+	if err != nil {
+		return err
 	}
+
+	_, span := c.startSpan(context.Background(), "ilmari.Get",
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	u, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Convert back to typed object
+	return runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, obj)
 }
 
 // Delete removes a resource from the test namespace.
-func (c *Context) Delete(name string, obj runtime.Object) error {
-	ctx := context.Background()
-
-	switch obj.(type) {
-	case *corev1.ConfigMap:
-		return c.Client.CoreV1().ConfigMaps(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	case *corev1.Secret:
-		return c.Client.CoreV1().Secrets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	case *corev1.Service:
-		return c.Client.CoreV1().Services(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	case *corev1.Pod:
-		return c.Client.CoreV1().Pods(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	case *appsv1.Deployment:
-		return c.Client.AppsV1().Deployments(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	case *appsv1.StatefulSet:
-		return c.Client.AppsV1().StatefulSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	case *appsv1.DaemonSet:
-		return c.Client.AppsV1().DaemonSets(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	default:
-		return fmt.Errorf("unsupported type: %T", obj)
+// Works with any resource type including CRDs.
+func (c *Context) Delete(name string, obj runtime.Object) (err error) {
+	gvr, err := c.getGVR(obj)
+	if err != nil {
+		return err
 	}
+
+	_, span := c.startSpan(context.Background(), "ilmari.Delete",
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	return c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
 }
 
 // List retrieves all resources of a type from the test namespace.
-func (c *Context) List(list runtime.Object) error {
-	ctx := context.Background()
-	opts := metav1.ListOptions{}
-
-	switch l := list.(type) {
-	case *corev1.ConfigMapList:
-		got, err := c.Client.CoreV1().ConfigMaps(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	case *corev1.SecretList:
-		got, err := c.Client.CoreV1().Secrets(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	case *corev1.ServiceList:
-		got, err := c.Client.CoreV1().Services(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	case *corev1.PodList:
-		got, err := c.Client.CoreV1().Pods(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	case *appsv1.DeploymentList:
-		got, err := c.Client.AppsV1().Deployments(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	case *appsv1.StatefulSetList:
-		got, err := c.Client.AppsV1().StatefulSets(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	case *appsv1.DaemonSetList:
-		got, err := c.Client.AppsV1().DaemonSets(c.Namespace).List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		*l = *got
-		return nil
-
-	default:
-		return fmt.Errorf("unsupported type: %T", list)
+// Works with any resource type including CRDs.
+func (c *Context) List(list runtime.Object) (err error) {
+	gvr, err := c.getGVR(list)
+	if err != nil {
+		return err
 	}
+
+	_, span := c.startSpan(context.Background(), "ilmari.List",
+		attribute.String("resource", gvr.Resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	u, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Convert back to typed list
+	return runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), list)
 }
 
 // WaitReady waits for a resource to be ready.
@@ -459,10 +453,22 @@ func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool)
 }
 
 // WaitForTimeout waits for a custom condition with timeout.
-func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) error {
+func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitFor",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -475,8 +481,9 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	defer ticker.Stop()
 
 	for {
-		obj, err := c.getResource(kind, name)
-		if err != nil {
+		obj, getErr := c.getResource(kind, name)
+		if getErr != nil {
+			err = getErr
 			return err
 		}
 		if obj != nil && condition(obj) {
@@ -485,7 +492,8 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for %s", resource)
+			err = fmt.Errorf("timeout waiting for %s", resource)
+			return err
 		case <-ticker.C:
 		}
 	}
@@ -551,10 +559,22 @@ func (c *Context) getResource(kind, name string) (interface{}, error) {
 }
 
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
-func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
+func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitReady",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -567,7 +587,8 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 	defer ticker.Stop()
 
 	for {
-		ready, err := c.isReady(kind, name)
+		var ready bool
+		ready, err = c.isReady(kind, name)
 		if err != nil {
 			return err
 		}
@@ -577,7 +598,8 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for %s to be ready", resource)
+			err = fmt.Errorf("timeout waiting for %s to be ready", resource)
+			return err
 		case <-ticker.C:
 		}
 	}
@@ -665,40 +687,75 @@ func isDaemonSetReady(ds *appsv1.DaemonSet) bool {
 }
 
 // Logs retrieves logs from a pod.
-func (c *Context) Logs(pod string) (string, error) {
+func (c *Context) Logs(pod string) (result string, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Logs",
+		attribute.String("pod", pod))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{})
 	stream, err := req.Stream(context.Background())
 	if err != nil {
-		return "", fmt.Errorf("failed to get logs: %w", err)
+		err = fmt.Errorf("failed to get logs: %w", err)
+		return "", err
 	}
 	defer stream.Close()
 
 	buf := new(strings.Builder)
-	if _, err := io.Copy(buf, stream); err != nil {
-		return "", fmt.Errorf("failed to read logs: %w", err)
+	if _, err = io.Copy(buf, stream); err != nil {
+		err = fmt.Errorf("failed to read logs: %w", err)
+		return "", err
 	}
 	return buf.String(), nil
 }
 
 // Events returns all events in the test namespace.
-func (c *Context) Events() ([]corev1.Event, error) {
+func (c *Context) Events() (events []corev1.Event, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Events")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	list, err := c.Client.CoreV1().Events(c.Namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list events: %w", err)
+		err = fmt.Errorf("failed to list events: %w", err)
+		return nil, err
 	}
 	return list.Items, nil
 }
 
 // Exec executes a command in a pod.
-func (c *Context) Exec(pod string, cmd []string) (string, error) {
+func (c *Context) Exec(pod string, cmd []string) (result string, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Exec",
+		attribute.String("pod", pod),
+		attribute.StringSlice("command", cmd))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		return "", fmt.Errorf("failed to get config: %w", err)
+		err = fmt.Errorf("failed to get config: %w", err)
+		return "", err
 	}
 
 	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		return "", fmt.Errorf("failed to add scheme: %w", err)
+	if err = corev1.AddToScheme(scheme); err != nil {
+		err = fmt.Errorf("failed to add scheme: %w", err)
+		return "", err
 	}
 
 	req := c.Client.CoreV1().RESTClient().Post().
@@ -712,18 +769,20 @@ func (c *Context) Exec(pod string, cmd []string) (string, error) {
 			Stderr:  true,
 		}, runtime.NewParameterCodec(scheme))
 
-	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
-		return "", fmt.Errorf("failed to create executor: %w", err)
+		err = fmt.Errorf("failed to create executor: %w", err)
+		return "", err
 	}
 
 	var stdout, stderr strings.Builder
-	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
 		Stdout: &stdout,
 		Stderr: &stderr,
 	})
 	if err != nil {
-		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+		err = fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+		return "", err
 	}
 
 	return stdout.String(), nil
@@ -736,6 +795,7 @@ type PortForward struct {
 	doneChan   chan struct{}
 	httpClient *http.Client
 	err        error
+	span       trace.Span
 }
 
 // Close closes the port forward and waits for cleanup.
@@ -745,6 +805,9 @@ func (pf *PortForward) Close() {
 	}
 	if pf.doneChan != nil {
 		<-pf.doneChan
+	}
+	if pf.span != nil {
+		pf.span.End()
 	}
 }
 
@@ -761,13 +824,28 @@ func (pf *PortForward) Get(path string) (*http.Response, error) {
 // Forward creates a port forward to a pod or service.
 // Resource format: "svc/name" or "pod/name"
 func (c *Context) Forward(resource string, port int) *PortForward {
+	_, span := c.startSpan(context.Background(), "ilmari.Forward",
+		attribute.String("resource", resource),
+		attribute.Int("port", port))
+
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
+		span.RecordError(fmt.Errorf("invalid resource format"))
+		span.SetStatus(codes.Error, "invalid resource format")
+		span.End()
 		return &PortForward{err: fmt.Errorf("invalid resource format %q, expected kind/name", resource)}
 	}
 
 	kind := strings.ToLower(parts[0])
 	name := parts[1]
+
+	// Helper to return error with span handling
+	returnErr := func(err error) *PortForward {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
+		return &PortForward{err: err}
+	}
 
 	// Get pod name
 	var podName string
@@ -780,7 +858,7 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 		// Get service and find a pod
 		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return &PortForward{err: fmt.Errorf("failed to get service: %w", err)}
+			return returnErr(fmt.Errorf("failed to get service: %w", err))
 		}
 
 		// Find pods matching the service selector
@@ -788,25 +866,25 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 			LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		})
 		if err != nil {
-			return &PortForward{err: fmt.Errorf("failed to list pods: %w", err)}
+			return returnErr(fmt.Errorf("failed to list pods: %w", err))
 		}
 		if len(pods.Items) == 0 {
-			return &PortForward{err: fmt.Errorf("no pods found for service %s", name)}
+			return returnErr(fmt.Errorf("no pods found for service %s", name))
 		}
 		podName = pods.Items[0].Name
 	default:
-		return &PortForward{err: fmt.Errorf("unsupported kind %q, use pod or svc", kind)}
+		return returnErr(fmt.Errorf("unsupported kind %q, use pod or svc", kind))
 	}
 
 	// Set up port forward
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to get config: %w", err)}
+		return returnErr(fmt.Errorf("failed to get config: %w", err))
 	}
 
 	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to create round tripper: %w", err)}
+		return returnErr(fmt.Errorf("failed to create round tripper: %w", err))
 	}
 
 	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", c.Namespace, podName)
@@ -823,7 +901,7 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 	ports := []string{fmt.Sprintf("0:%d", port)}
 	pf, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to create port forward: %w", err)}
+		return returnErr(fmt.Errorf("failed to create port forward: %w", err))
 	}
 
 	doneChan := make(chan struct{})
@@ -837,20 +915,32 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 	select {
 	case <-readyChan:
 	case err := <-errChan:
-		return &PortForward{err: fmt.Errorf("port forward failed: %w", err)}
+		return returnErr(fmt.Errorf("port forward failed: %w", err))
 	}
 
 	forwardedPorts, err := pf.GetPorts()
 	if err != nil || len(forwardedPorts) == 0 {
-		return &PortForward{err: fmt.Errorf("failed to get forwarded ports: %w", err)}
+		return returnErr(fmt.Errorf("failed to get forwarded ports: %w", err))
 	}
 
+	// Return with span - it will be closed in PortForward.Close()
 	return &PortForward{
 		localPort:  int(forwardedPorts[0].Local),
 		stopChan:   stopChan,
 		doneChan:   doneChan,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		span:       span,
 	}
+}
+
+// MustForward creates a port forward and panics on error.
+// Useful for test setup where errors should fail immediately.
+func (c *Context) MustForward(resource string, port int) *PortForward {
+	pf := c.Forward(resource, port)
+	if pf.err != nil {
+		panic(fmt.Sprintf("MustForward failed: %v", pf.err))
+	}
+	return pf
 }
 
 // Stack represents a collection of services to deploy together.
@@ -860,13 +950,15 @@ type Stack struct {
 
 // ServiceBuilder builds a service configuration.
 type ServiceBuilder struct {
-	stack    *Stack
-	name     string
-	image    string
-	port     int32
-	replicas int32
-	env      map[string]string
-	command  []string
+	stack          *Stack
+	name           string
+	image          string
+	port           int32
+	replicas       int32
+	env            map[string]string
+	command        []string
+	resourceLimits corev1.ResourceList
+	envFrom        []corev1.EnvFromSource
 }
 
 // NewStack creates a new empty stack.
@@ -916,6 +1008,34 @@ func (sb *ServiceBuilder) Command(cmd ...string) *ServiceBuilder {
 	return sb
 }
 
+// EnvFrom loads environment variables from a ConfigMap or Secret.
+// Resource format: "configmap/name" or "secret/name"
+func (sb *ServiceBuilder) EnvFrom(resource string) *ServiceBuilder {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		return sb
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	switch kind {
+	case "configmap":
+		sb.envFrom = append(sb.envFrom, corev1.EnvFromSource{
+			ConfigMapRef: &corev1.ConfigMapEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: name},
+			},
+		})
+	case "secret":
+		sb.envFrom = append(sb.envFrom, corev1.EnvFromSource{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: name},
+			},
+		})
+	}
+	return sb
+}
+
 // Service adds another service to the stack (for chaining).
 func (sb *ServiceBuilder) Service(name string) *ServiceBuilder {
 	return sb.stack.Service(name)
@@ -927,18 +1047,30 @@ func (sb *ServiceBuilder) Build() *Stack {
 }
 
 // Up deploys the stack and waits for all services to be ready.
-func (c *Context) Up(stack *Stack) error {
+func (c *Context) Up(stack *Stack) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Up",
+		attribute.Int("service_count", len(stack.services)))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	// Deploy all services
 	for _, svc := range stack.services {
-		if err := c.deployService(svc); err != nil {
-			return fmt.Errorf("failed to deploy %s: %w", svc.name, err)
+		if err = c.deployService(svc); err != nil {
+			err = fmt.Errorf("failed to deploy %s: %w", svc.name, err)
+			return err
 		}
 	}
 
 	// Wait for all deployments to be ready
 	for _, svc := range stack.services {
-		if err := c.WaitReady("deployment/" + svc.name); err != nil {
-			return fmt.Errorf("failed waiting for %s: %w", svc.name, err)
+		if err = c.WaitReady("deployment/" + svc.name); err != nil {
+			err = fmt.Errorf("failed waiting for %s: %w", svc.name, err)
+			return err
 		}
 	}
 
@@ -975,6 +1107,7 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 							Image:   sb.image,
 							Command: sb.command,
 							Env:     envVars,
+							EnvFrom: sb.envFrom,
 						},
 					},
 				},
@@ -986,6 +1119,14 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 	if sb.port > 0 {
 		deploy.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{
 			{ContainerPort: sb.port},
+		}
+	}
+
+	// Add resource limits if specified
+	if sb.resourceLimits != nil {
+		deploy.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+			Limits:   sb.resourceLimits,
+			Requests: sb.resourceLimits,
 		}
 	}
 
@@ -1012,4 +1153,554 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 	}
 
 	return nil
+}
+
+// Retry executes fn up to maxAttempts times with exponential backoff.
+// Backoff starts at 100ms and doubles each attempt, capped at 5s.
+// Returns nil on first success, or the last error after all attempts fail.
+func (c *Context) Retry(maxAttempts int, fn func() error) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Retry",
+		attribute.Int("max_attempts", maxAttempts))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	backoff := 100 * time.Millisecond
+	for i := 0; i < maxAttempts; i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if i < maxAttempts-1 {
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > 5*time.Second {
+				backoff = 5 * time.Second
+			}
+		}
+	}
+	return err
+}
+
+// Kill deletes a pod, useful for chaos testing.
+// Resource format: "pod/name" or just "name" (assumes pod)
+func (c *Context) Kill(resource string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Kill",
+		attribute.String("resource", resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Parse resource
+	var podName string
+	if strings.Contains(resource, "/") {
+		parts := strings.SplitN(resource, "/", 2)
+		if strings.ToLower(parts[0]) != "pod" {
+			err = fmt.Errorf("Kill only supports pods, got %s", parts[0])
+			return err
+		}
+		podName = parts[1]
+	} else {
+		podName = resource
+	}
+
+	// Delete with zero grace period for immediate termination
+	grace := int64(0)
+	err = c.Client.CoreV1().Pods(c.Namespace).Delete(
+		context.Background(),
+		podName,
+		metav1.DeleteOptions{GracePeriodSeconds: &grace},
+	)
+	return err
+}
+
+// LoadYAML loads and applies a YAML file from the given path.
+// Supports single or multi-document YAML files.
+func (c *Context) LoadYAML(path string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.LoadYAML",
+		attribute.String("path", path))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+
+	return c.applyYAML(data)
+}
+
+// LoadYAMLDir loads and applies all YAML files from a directory.
+// Only processes .yaml and .yml files in the top-level directory (non-recursive).
+func (c *Context) LoadYAMLDir(dir string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.LoadYAMLDir",
+		attribute.String("dir", dir))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to read directory %s: %w", dir, err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") {
+			if err := c.LoadYAML(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// applyYAML parses and applies YAML content.
+func (c *Context) applyYAML(data []byte) error {
+	// Normalize line endings (CRLF -> LF) for Windows compatibility
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	// Split multi-document YAML
+	docs := strings.Split(content, "\n---")
+	for _, doc := range docs {
+		doc = strings.TrimSpace(doc)
+		if doc == "" || doc == "---" {
+			continue
+		}
+
+		// Parse to unstructured to determine type
+		var obj unstructured.Unstructured
+		if err := yaml.Unmarshal([]byte(doc), &obj.Object); err != nil {
+			return fmt.Errorf("failed to parse YAML: %w", err)
+		}
+
+		if len(obj.Object) == 0 {
+			continue
+		}
+
+		// Try to apply as typed resource first
+		if err := c.applyTypedYAML([]byte(doc), obj.GetKind()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyTypedYAML applies YAML as a typed resource.
+func (c *Context) applyTypedYAML(data []byte, kind string) error {
+	switch kind {
+	case "ConfigMap":
+		var obj corev1.ConfigMap
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Secret":
+		var obj corev1.Secret
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Service":
+		var obj corev1.Service
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Pod":
+		var obj corev1.Pod
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "Deployment":
+		var obj appsv1.Deployment
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "StatefulSet":
+		var obj appsv1.StatefulSet
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	case "DaemonSet":
+		var obj appsv1.DaemonSet
+		if err := yaml.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		return c.Apply(&obj)
+	default:
+		return fmt.Errorf("unsupported kind in YAML: %s", kind)
+	}
+}
+
+// Assert returns an assertion builder for the given resource.
+// Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
+func (c *Context) Assert(resource string) *Assertion {
+	return &Assertion{
+		ctx:      c,
+		resource: resource,
+	}
+}
+
+// Assertion provides fluent assertions for Kubernetes resources.
+type Assertion struct {
+	ctx      *Context
+	resource string
+	err      error
+}
+
+// HasLabel asserts the resource has the given label with value.
+func (a *Assertion) HasLabel(key, value string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if obj == nil {
+		a.err = fmt.Errorf("resource %s not found", a.resource)
+		return a
+	}
+
+	// Get labels from the object
+	var labels map[string]string
+	switch o := obj.(type) {
+	case *corev1.Pod:
+		labels = o.Labels
+	case *corev1.ConfigMap:
+		labels = o.Labels
+	case *corev1.Secret:
+		labels = o.Labels
+	case *corev1.Service:
+		labels = o.Labels
+	case *appsv1.Deployment:
+		labels = o.Labels
+	case *appsv1.StatefulSet:
+		labels = o.Labels
+	case *appsv1.DaemonSet:
+		labels = o.Labels
+	default:
+		a.err = fmt.Errorf("HasLabel: unsupported resource type %T", obj)
+		return a
+	}
+
+	if labels[key] != value {
+		a.err = fmt.Errorf("expected label %s=%s, got %s=%s", key, value, key, labels[key])
+	}
+	return a
+}
+
+// HasAnnotation asserts the resource has the given annotation.
+func (a *Assertion) HasAnnotation(key, value string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if obj == nil {
+		a.err = fmt.Errorf("resource %s not found", a.resource)
+		return a
+	}
+
+	var annotations map[string]string
+	switch o := obj.(type) {
+	case *corev1.Pod:
+		annotations = o.Annotations
+	case *corev1.ConfigMap:
+		annotations = o.Annotations
+	case *corev1.Secret:
+		annotations = o.Annotations
+	case *corev1.Service:
+		annotations = o.Annotations
+	case *appsv1.Deployment:
+		annotations = o.Annotations
+	case *appsv1.StatefulSet:
+		annotations = o.Annotations
+	case *appsv1.DaemonSet:
+		annotations = o.Annotations
+	default:
+		a.err = fmt.Errorf("HasAnnotation: unsupported resource type %T", obj)
+		return a
+	}
+
+	if annotations[key] != value {
+		a.err = fmt.Errorf("expected annotation %s=%s, got %s=%s", key, value, key, annotations[key])
+	}
+	return a
+}
+
+// IsReady asserts the resource is ready.
+func (a *Assertion) IsReady() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	ready, err := a.ctx.isReady(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if !ready {
+		a.err = fmt.Errorf("resource %s is not ready", a.resource)
+	}
+	return a
+}
+
+// Exists asserts the resource exists.
+func (a *Assertion) Exists() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if obj == nil {
+		a.err = fmt.Errorf("resource %s does not exist", a.resource)
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *Assertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+// WARNING: This will panic and stop test execution immediately.
+// Use Error() instead if you need to handle failures gracefully.
+func (a *Assertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ApplyCRD applies a custom resource using the dynamic client.
+func (c *Context) ApplyCRD(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.ApplyCRD",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", obj.GetName()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	obj.SetNamespace(c.Namespace)
+	ctx := context.Background()
+
+	_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, obj, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		// Log the original create error for debugging
+		c.t.Logf("ApplyCRD: create returned IsAlreadyExists for %s/%s: %v", gvr.Resource, obj.GetName(), err)
+		updateErr := err // preserve original create error
+		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+		if err != nil {
+			// Wrap both errors for better diagnostics
+			return fmt.Errorf("ApplyCRD: create returned IsAlreadyExists (%v), but update failed: %w", updateErr, err)
+		}
+		return nil
+	}
+	return err
+}
+
+// GetCRD retrieves a custom resource.
+func (c *Context) GetCRD(gvr schema.GroupVersionResource, name string) (*unstructured.Unstructured, error) {
+	_, span := c.startSpan(context.Background(), "ilmari.GetCRD",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	var err error
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	result, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	return result, err
+}
+
+// DeleteCRD deletes a custom resource.
+func (c *Context) DeleteCRD(gvr schema.GroupVersionResource, name string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.DeleteCRD",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	return c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+}
+
+// Isolate creates a NetworkPolicy that blocks all ingress/egress traffic.
+// Useful for testing network isolation. The policy name is derived from the
+// selector, so calling Isolate multiple times with the same selector updates
+// the existing policy, while different selectors create separate policies.
+func (c *Context) Isolate(podSelector map[string]string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Isolate")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Generate deterministic name from selector
+	policyName := "ilmari-isolate"
+	if len(podSelector) > 0 {
+		// Use first key-value for name suffix (keeps it short and deterministic)
+		for k, v := range podSelector {
+			policyName = fmt.Sprintf("ilmari-isolate-%s-%s", k, v)
+			break
+		}
+	}
+
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      policyName,
+			Namespace: c.Namespace,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: podSelector,
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			// Empty ingress/egress = deny all
+			Ingress: []networkingv1.NetworkPolicyIngressRule{},
+			Egress:  []networkingv1.NetworkPolicyEgressRule{},
+		},
+	}
+
+	_, err = c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Create(
+		context.Background(), policy, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		_, err = c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Update(
+			context.Background(), policy, metav1.UpdateOptions{})
+	}
+	return err
+}
+
+// AllowFrom creates a NetworkPolicy allowing traffic from specific pods.
+func (c *Context) AllowFrom(targetSelector, sourceSelector map[string]string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.AllowFrom")
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	policy := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("ilmari-allow-%s", uuid.New().String()[:8]),
+			Namespace: c.Namespace,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: targetSelector,
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: []networkingv1.NetworkPolicyPeer{
+						{
+							PodSelector: &metav1.LabelSelector{
+								MatchLabels: sourceSelector,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err = c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Create(
+		context.Background(), policy, metav1.CreateOptions{})
+	return err
+}
+
+// Resources sets resource limits and requests for the ServiceBuilder.
+// Both limits and requests are set to the same values for simplicity.
+func (sb *ServiceBuilder) Resources(cpu, memory string) *ServiceBuilder {
+	sb.resourceLimits = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+	}
+	return sb
 }
