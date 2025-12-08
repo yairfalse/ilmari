@@ -1156,6 +1156,7 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 }
 
 // Retry executes fn up to maxAttempts times with exponential backoff.
+// Backoff starts at 100ms and doubles each attempt, capped at 5s.
 // Returns nil on first success, or the last error after all attempts fail.
 func (c *Context) Retry(maxAttempts int, fn func() error) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.Retry",
@@ -1243,6 +1244,7 @@ func (c *Context) LoadYAML(path string) (err error) {
 }
 
 // LoadYAMLDir loads and applies all YAML files from a directory.
+// Only processes .yaml and .yml files in the top-level directory (non-recursive).
 func (c *Context) LoadYAMLDir(dir string) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.LoadYAMLDir",
 		attribute.String("dir", dir))
@@ -1693,7 +1695,8 @@ func (c *Context) AllowFrom(targetSelector, sourceSelector map[string]string) (e
 	return err
 }
 
-// Resources sets resource limits/requests for the ServiceBuilder.
+// Resources sets resource limits and requests for the ServiceBuilder.
+// Both limits and requests are set to the same values for simplicity.
 func (sb *ServiceBuilder) Resources(cpu, memory string) *ServiceBuilder {
 	sb.resourceLimits = corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(cpu),
