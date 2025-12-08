@@ -1275,8 +1275,10 @@ func (c *Context) LoadYAMLDir(dir string) (err error) {
 
 // applyYAML parses and applies YAML content.
 func (c *Context) applyYAML(data []byte) error {
+	// Normalize line endings (CRLF -> LF) for Windows compatibility
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
 	// Split multi-document YAML
-	docs := strings.Split(string(data), "\n---")
+	docs := strings.Split(content, "\n---")
 	for _, doc := range docs {
 		doc = strings.TrimSpace(doc)
 		if doc == "" || doc == "---" {
@@ -1406,6 +1408,9 @@ func (a *Assertion) HasLabel(key, value string) *Assertion {
 		labels = o.Labels
 	case *appsv1.DaemonSet:
 		labels = o.Labels
+	default:
+		a.err = fmt.Errorf("HasLabel: unsupported resource type %T", obj)
+		return a
 	}
 
 	if labels[key] != value {
@@ -1452,6 +1457,9 @@ func (a *Assertion) HasAnnotation(key, value string) *Assertion {
 		annotations = o.Annotations
 	case *appsv1.DaemonSet:
 		annotations = o.Annotations
+	default:
+		a.err = fmt.Errorf("HasAnnotation: unsupported resource type %T", obj)
+		return a
 	}
 
 	if annotations[key] != value {
@@ -1512,6 +1520,8 @@ func (a *Assertion) Error() error {
 }
 
 // Must panics if any assertion failed.
+// WARNING: This will panic and stop test execution immediately.
+// Use Error() instead if you need to handle failures gracefully.
 func (a *Assertion) Must() {
 	if a.err != nil {
 		panic(a.err)
@@ -1590,7 +1600,9 @@ func (c *Context) DeleteCRD(gvr schema.GroupVersionResource, name string) (err e
 }
 
 // Isolate creates a NetworkPolicy that blocks all ingress/egress traffic.
-// Useful for testing network isolation.
+// Useful for testing network isolation. The policy name is derived from the
+// selector, so calling Isolate multiple times with the same selector updates
+// the existing policy, while different selectors create separate policies.
 func (c *Context) Isolate(podSelector map[string]string) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.Isolate")
 	defer func() {
@@ -1601,9 +1613,19 @@ func (c *Context) Isolate(podSelector map[string]string) (err error) {
 		span.End()
 	}()
 
+	// Generate deterministic name from selector
+	policyName := "ilmari-isolate"
+	if len(podSelector) > 0 {
+		// Use first key-value for name suffix (keeps it short and deterministic)
+		for k, v := range podSelector {
+			policyName = fmt.Sprintf("ilmari-isolate-%s-%s", k, v)
+			break
+		}
+	}
+
 	policy := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "ilmari-isolate",
+			Name:      policyName,
 			Namespace: c.Namespace,
 		},
 		Spec: networkingv1.NetworkPolicySpec{
