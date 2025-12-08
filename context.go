@@ -1604,7 +1604,15 @@ func (c *Context) ApplyCRD(gvr schema.GroupVersionResource, obj *unstructured.Un
 
 	_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, obj, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
+		// Log the original create error for debugging
+		c.t.Logf("ApplyCRD: create returned IsAlreadyExists for %s/%s: %v", gvr.Resource, obj.GetName(), err)
+		updateErr := err // preserve original create error
 		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, obj, metav1.UpdateOptions{})
+		if err != nil {
+			// Wrap both errors for better diagnostics
+			return fmt.Errorf("ApplyCRD: create returned IsAlreadyExists (%v), but update failed: %w", updateErr, err)
+		}
+		return nil
 	}
 	return err
 }
