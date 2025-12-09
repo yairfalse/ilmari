@@ -1530,6 +1530,200 @@ func (a *Assertion) Must() {
 	}
 }
 
+// HasReplicas asserts the deployment/statefulset has the specified ready replicas.
+func (a *Assertion) HasReplicas(expected int) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+	ctx := context.Background()
+
+	var ready int32
+	switch kind {
+	case "deployment":
+		deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			a.err = err
+			return a
+		}
+		ready = deploy.Status.ReadyReplicas
+	case "statefulset":
+		ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			a.err = err
+			return a
+		}
+		ready = ss.Status.ReadyReplicas
+	default:
+		a.err = fmt.Errorf("HasReplicas: unsupported kind %s (use deployment or statefulset)", kind)
+		return a
+	}
+
+	if int(ready) != expected {
+		a.err = fmt.Errorf("expected %d ready replicas, got %d", expected, ready)
+	}
+	return a
+}
+
+// IsProgressing asserts the deployment is progressing (not stalled).
+func (a *Assertion) IsProgressing() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "deployment" {
+		a.err = fmt.Errorf("IsProgressing: only supports deployments, got %s", kind)
+		return a
+	}
+
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	// Check for Progressing condition
+	for _, cond := range deploy.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing {
+			if cond.Status == corev1.ConditionTrue {
+				return a // progressing
+			}
+			a.err = fmt.Errorf("deployment not progressing: %s", cond.Message)
+			return a
+		}
+	}
+
+	a.err = fmt.Errorf("deployment has no Progressing condition")
+	return a
+}
+
+// HasNoRestarts asserts the pod's containers have zero restarts.
+func (a *Assertion) HasNoRestarts() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pod" {
+		a.err = fmt.Errorf("HasNoRestarts: only supports pods, got %s", kind)
+		return a
+	}
+
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.RestartCount > 0 {
+			a.err = fmt.Errorf("container %s has %d restarts", cs.Name, cs.RestartCount)
+			return a
+		}
+	}
+	return a
+}
+
+// LogsContain asserts the pod's logs contain the specified text.
+func (a *Assertion) LogsContain(text string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pod" {
+		a.err = fmt.Errorf("LogsContain: only supports pods, got %s", kind)
+		return a
+	}
+
+	logs, err := a.ctx.Logs(name)
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	if !strings.Contains(logs, text) {
+		a.err = fmt.Errorf("logs do not contain %q", text)
+	}
+	return a
+}
+
+// NoOOMKills asserts the pod has no containers terminated due to OOM.
+func (a *Assertion) NoOOMKills() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pod" {
+		a.err = fmt.Errorf("NoOOMKills: only supports pods, got %s", kind)
+		return a
+	}
+
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.LastTerminationState.Terminated != nil {
+			if cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
+				a.err = fmt.Errorf("container %s was OOMKilled", cs.Name)
+				return a
+			}
+		}
+		if cs.State.Terminated != nil {
+			if cs.State.Terminated.Reason == "OOMKilled" {
+				a.err = fmt.Errorf("container %s was OOMKilled", cs.Name)
+				return a
+			}
+		}
+	}
+	return a
+}
+
 // ApplyCRD applies a custom resource using the dynamic client.
 func (c *Context) ApplyCRD(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.ApplyCRD",

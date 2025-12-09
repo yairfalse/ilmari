@@ -1040,3 +1040,177 @@ func TestLoadYAMLWindowsLineEndings(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Semantic Assertions Tests
+// ============================================================================
+
+// TestAssertHasReplicas verifies HasReplicas checks ready replicas.
+func TestAssertHasReplicas(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		stack := NewStack().
+			Service("replicas-test").Image("nginx:alpine").Port(80).Replicas(2).
+			Build()
+
+		if err := ctx.Up(stack); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		// Should pass - 2 replicas ready
+		err := ctx.Assert("deployment/replicas-test").HasReplicas(2).Error()
+		if err != nil {
+			t.Errorf("HasReplicas(2) should pass: %v", err)
+		}
+
+		// Should fail - not 5 replicas
+		err = ctx.Assert("deployment/replicas-test").HasReplicas(5).Error()
+		if err == nil {
+			t.Error("HasReplicas(5) should fail")
+		}
+	})
+}
+
+// TestAssertIsProgressing verifies IsProgressing for deployments.
+func TestAssertIsProgressing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		stack := NewStack().
+			Service("progress-test").Image("nginx:alpine").Port(80).
+			Build()
+
+		if err := ctx.Up(stack); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		// Stable deployment should be progressing (or complete)
+		err := ctx.Assert("deployment/progress-test").IsProgressing().Error()
+		if err != nil {
+			t.Errorf("IsProgressing should pass for healthy deployment: %v", err)
+		}
+	})
+}
+
+// TestAssertHasNoRestarts verifies HasNoRestarts checks container restarts.
+func TestAssertHasNoRestarts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "no-restart-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/no-restart-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Fresh pod should have no restarts
+		err := ctx.Assert("pod/no-restart-test").HasNoRestarts().Error()
+		if err != nil {
+			t.Errorf("HasNoRestarts should pass: %v", err)
+		}
+	})
+}
+
+// TestAssertLogsContain verifies LogsContain checks pod logs.
+func TestAssertLogsContain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "logs-test",
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "echo 'ilmari-marker-12345' && sleep 60"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/logs-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait a moment for logs
+		time.Sleep(2 * time.Second)
+
+		// Should find the marker
+		err := ctx.Assert("pod/logs-test").LogsContain("ilmari-marker-12345").Error()
+		if err != nil {
+			t.Errorf("LogsContain should pass: %v", err)
+		}
+
+		// Should not find random string
+		err = ctx.Assert("pod/logs-test").LogsContain("nonexistent-xyz-987").Error()
+		if err == nil {
+			t.Error("LogsContain should fail for missing text")
+		}
+	})
+}
+
+// TestAssertNoOOMKills verifies NoOOMKills checks for OOM terminations.
+func TestAssertNoOOMKills(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "oom-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/oom-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Normal pod should have no OOM kills
+		err := ctx.Assert("pod/oom-test").NoOOMKills().Error()
+		if err != nil {
+			t.Errorf("NoOOMKills should pass: %v", err)
+		}
+	})
+}
