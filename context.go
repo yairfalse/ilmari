@@ -1898,3 +1898,179 @@ func (sb *ServiceBuilder) Resources(cpu, memory string) *ServiceBuilder {
 	}
 	return sb
 }
+
+// ============================================================================
+// Fluent Deployment Builder
+// ============================================================================
+
+// DeploymentBuilder provides a fluent API for building Deployments.
+type DeploymentBuilder struct {
+	name       string
+	image      string
+	replicas   int32
+	port       int32
+	env        map[string]string
+	command    []string
+	withProbes bool
+}
+
+// Deployment creates a new DeploymentBuilder with the given name.
+func Deployment(name string) *DeploymentBuilder {
+	return &DeploymentBuilder{
+		name:     name,
+		replicas: 1,
+		env:      make(map[string]string),
+	}
+}
+
+// Image sets the container image.
+func (d *DeploymentBuilder) Image(image string) *DeploymentBuilder {
+	d.image = image
+	return d
+}
+
+// Replicas sets the number of replicas.
+func (d *DeploymentBuilder) Replicas(n int) *DeploymentBuilder {
+	d.replicas = int32(n)
+	return d
+}
+
+// Port sets the container port.
+func (d *DeploymentBuilder) Port(port int) *DeploymentBuilder {
+	d.port = int32(port)
+	return d
+}
+
+// Env adds an environment variable.
+func (d *DeploymentBuilder) Env(key, value string) *DeploymentBuilder {
+	d.env[key] = value
+	return d
+}
+
+// Command sets the container command.
+func (d *DeploymentBuilder) Command(cmd ...string) *DeploymentBuilder {
+	d.command = cmd
+	return d
+}
+
+// WithProbes adds sensible default liveness and readiness probes.
+func (d *DeploymentBuilder) WithProbes() *DeploymentBuilder {
+	d.withProbes = true
+	return d
+}
+
+// Build creates the Deployment object.
+func (d *DeploymentBuilder) Build() *appsv1.Deployment {
+	// Build env vars
+	var envVars []corev1.EnvVar
+	for k, v := range d.env {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+	}
+
+	container := corev1.Container{
+		Name:    d.name,
+		Image:   d.image,
+		Command: d.command,
+		Env:     envVars,
+	}
+
+	if d.port > 0 {
+		container.Ports = []corev1.ContainerPort{{ContainerPort: d.port}}
+	}
+
+	if d.withProbes && d.port > 0 {
+		container.LivenessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt32(d.port),
+				},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+		}
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt32(d.port),
+				},
+			},
+			InitialDelaySeconds: 2,
+			PeriodSeconds:       5,
+		}
+	}
+
+	replicas := d.replicas
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: d.name,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": d.name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": d.name},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{container},
+				},
+			},
+		},
+	}
+}
+
+// ============================================================================
+// Fixture Loading with Overrides
+// ============================================================================
+
+// FixtureBuilder loads YAML and allows overrides before applying.
+type FixtureBuilder struct {
+	deploy *appsv1.Deployment
+	err    error
+}
+
+// LoadFixture loads a Deployment from a YAML file.
+func (c *Context) LoadFixture(path string) *FixtureBuilder {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return &FixtureBuilder{err: fmt.Errorf("failed to read fixture: %w", err)}
+	}
+
+	var deploy appsv1.Deployment
+	if err := yaml.Unmarshal(data, &deploy); err != nil {
+		return &FixtureBuilder{err: fmt.Errorf("failed to parse fixture: %w", err)}
+	}
+
+	return &FixtureBuilder{deploy: &deploy}
+}
+
+// WithImage overrides the container image.
+func (f *FixtureBuilder) WithImage(image string) *FixtureBuilder {
+	if f.err != nil || f.deploy == nil {
+		return f
+	}
+	if len(f.deploy.Spec.Template.Spec.Containers) > 0 {
+		f.deploy.Spec.Template.Spec.Containers[0].Image = image
+	}
+	return f
+}
+
+// WithReplicas overrides the replica count.
+func (f *FixtureBuilder) WithReplicas(n int) *FixtureBuilder {
+	if f.err != nil || f.deploy == nil {
+		return f
+	}
+	replicas := int32(n)
+	f.deploy.Spec.Replicas = &replicas
+	return f
+}
+
+// Build returns the Deployment (or panics on error).
+func (f *FixtureBuilder) Build() *appsv1.Deployment {
+	if f.err != nil {
+		panic(f.err)
+	}
+	return f.deploy
+}

@@ -1214,3 +1214,140 @@ func TestAssertNoOOMKills(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Fluent Deployment Builder Tests
+// ============================================================================
+
+// TestDeploymentBuilder verifies fluent Deployment builder.
+func TestDeploymentBuilder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("fluent-test").
+			Image("nginx:alpine").
+			Replicas(2).
+			Port(80).
+			Env("FOO", "bar").
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/fluent-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		got := &appsv1.Deployment{}
+		if err := ctx.Get("fluent-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if *got.Spec.Replicas != 2 {
+			t.Errorf("expected 2 replicas, got %d", *got.Spec.Replicas)
+		}
+
+		container := got.Spec.Template.Spec.Containers[0]
+		if container.Image != "nginx:alpine" {
+			t.Errorf("expected image nginx:alpine, got %s", container.Image)
+		}
+	})
+}
+
+// TestDeploymentBuilderWithProbes verifies WithProbes adds sensible defaults.
+func TestDeploymentBuilderWithProbes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("probes-test").
+			Image("nginx:alpine").
+			Port(80).
+			WithProbes().
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		got := &appsv1.Deployment{}
+		if err := ctx.Get("probes-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		container := got.Spec.Template.Spec.Containers[0]
+		if container.LivenessProbe == nil {
+			t.Error("expected liveness probe")
+		}
+		if container.ReadinessProbe == nil {
+			t.Error("expected readiness probe")
+		}
+	})
+}
+
+// TestLoadFixture verifies LoadFixture loads YAML with overrides.
+func TestLoadFixture(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create fixture file
+		yamlContent := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fixture-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fixture-test
+  template:
+    metadata:
+      labels:
+        app: fixture-test
+    spec:
+      containers:
+      - name: main
+        image: nginx:1.20
+        ports:
+        - containerPort: 80
+`
+		tmpDir := t.TempDir()
+		fixturePath := filepath.Join(tmpDir, "deployment.yaml")
+		if err := os.WriteFile(fixturePath, []byte(yamlContent), 0644); err != nil {
+			t.Fatalf("Failed to write fixture: %v", err)
+		}
+
+		// Load with overrides
+		deploy := ctx.LoadFixture(fixturePath).
+			WithImage("nginx:alpine").
+			WithReplicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/fixture-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		got := &appsv1.Deployment{}
+		if err := ctx.Get("fixture-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		// Should have overridden values
+		if *got.Spec.Replicas != 1 {
+			t.Errorf("expected 1 replica (overridden), got %d", *got.Spec.Replicas)
+		}
+		if got.Spec.Template.Spec.Containers[0].Image != "nginx:alpine" {
+			t.Errorf("expected image nginx:alpine (overridden), got %s", got.Spec.Template.Spec.Containers[0].Image)
+		}
+	})
+}
