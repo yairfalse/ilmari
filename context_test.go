@@ -1351,3 +1351,114 @@ spec:
 		}
 	})
 }
+
+// ============================================================================
+// Eventually/Consistently Tests
+// ============================================================================
+
+// TestEventuallySucceeds verifies Eventually waits for condition.
+func TestEventuallySucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "eventually-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Eventually the pod should be running
+		err := ctx.Eventually(func() bool {
+			p := &corev1.Pod{}
+			if err := ctx.Get("eventually-test", p); err != nil {
+				return false
+			}
+			return p.Status.Phase == corev1.PodRunning
+		}).Within(60 * time.Second).ProbeEvery(1 * time.Second).Wait()
+
+		if err != nil {
+			t.Fatalf("Eventually failed: %v", err)
+		}
+	})
+}
+
+// TestEventuallyTimesOut verifies Eventually returns error on timeout.
+func TestEventuallyTimesOut(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// This will never be true
+		err := ctx.Eventually(func() bool {
+			return false
+		}).Within(2 * time.Second).ProbeEvery(100 * time.Millisecond).Wait()
+
+		if err == nil {
+			t.Error("expected timeout error")
+		}
+	})
+}
+
+// TestConsistentlySucceeds verifies Consistently passes when condition stays true.
+func TestConsistentlySucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "consistent-test",
+			},
+			Data: map[string]string{"key": "value"},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// ConfigMap should stay present
+		err := ctx.Consistently(func() bool {
+			c := &corev1.ConfigMap{}
+			return ctx.Get("consistent-test", c) == nil
+		}).For(2 * time.Second).ProbeEvery(200 * time.Millisecond).Wait()
+
+		if err != nil {
+			t.Errorf("Consistently failed: %v", err)
+		}
+	})
+}
+
+// TestConsistentlyFails verifies Consistently fails if condition becomes false.
+func TestConsistentlyFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		counter := 0
+		// Will become false after a few checks
+		err := ctx.Consistently(func() bool {
+			counter++
+			return counter < 5
+		}).For(5 * time.Second).ProbeEvery(100 * time.Millisecond).Wait()
+
+		if err == nil {
+			t.Error("expected failure when condition becomes false")
+		}
+	})
+}

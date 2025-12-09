@@ -2074,3 +2074,134 @@ func (f *FixtureBuilder) Build() *appsv1.Deployment {
 	}
 	return f.deploy
 }
+
+// ============================================================================
+// Eventually/Consistently - Flakiness Protection
+// ============================================================================
+
+// EventuallyBuilder polls a condition until it becomes true or times out.
+type EventuallyBuilder struct {
+	ctx      *Context
+	fn       func() bool
+	timeout  time.Duration
+	interval time.Duration
+}
+
+// Eventually creates an EventuallyBuilder that waits for a condition.
+func (c *Context) Eventually(fn func() bool) *EventuallyBuilder {
+	return &EventuallyBuilder{
+		ctx:      c,
+		fn:       fn,
+		timeout:  30 * time.Second, // default
+		interval: 1 * time.Second,  // default
+	}
+}
+
+// Within sets the maximum time to wait.
+func (e *EventuallyBuilder) Within(timeout time.Duration) *EventuallyBuilder {
+	e.timeout = timeout
+	return e
+}
+
+// ProbeEvery sets the polling interval.
+func (e *EventuallyBuilder) ProbeEvery(interval time.Duration) *EventuallyBuilder {
+	e.interval = interval
+	return e
+}
+
+// Wait blocks until the condition is true or timeout is reached.
+func (e *EventuallyBuilder) Wait() error {
+	_, span := e.ctx.startSpan(context.Background(), "ilmari.Eventually",
+		attribute.Int64("timeout_ms", e.timeout.Milliseconds()),
+		attribute.Int64("interval_ms", e.interval.Milliseconds()))
+	defer span.End()
+
+	deadline := time.Now().Add(e.timeout)
+	ticker := time.NewTicker(e.interval)
+	defer ticker.Stop()
+
+	// Check immediately
+	if e.fn() {
+		return nil
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			if e.fn() {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				err := fmt.Errorf("condition not met within %v", e.timeout)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return err
+			}
+		}
+	}
+}
+
+// ConsistentlyBuilder checks that a condition stays true for a duration.
+type ConsistentlyBuilder struct {
+	ctx      *Context
+	fn       func() bool
+	duration time.Duration
+	interval time.Duration
+}
+
+// Consistently creates a ConsistentlyBuilder that checks a condition stays true.
+func (c *Context) Consistently(fn func() bool) *ConsistentlyBuilder {
+	return &ConsistentlyBuilder{
+		ctx:      c,
+		fn:       fn,
+		duration: 5 * time.Second,  // default
+		interval: 500 * time.Millisecond, // default
+	}
+}
+
+// For sets how long the condition must stay true.
+func (c *ConsistentlyBuilder) For(duration time.Duration) *ConsistentlyBuilder {
+	c.duration = duration
+	return c
+}
+
+// ProbeEvery sets the checking interval.
+func (c *ConsistentlyBuilder) ProbeEvery(interval time.Duration) *ConsistentlyBuilder {
+	c.interval = interval
+	return c
+}
+
+// Wait blocks and checks the condition repeatedly for the duration.
+func (c *ConsistentlyBuilder) Wait() error {
+	_, span := c.ctx.startSpan(context.Background(), "ilmari.Consistently",
+		attribute.Int64("duration_ms", c.duration.Milliseconds()),
+		attribute.Int64("interval_ms", c.interval.Milliseconds()))
+	defer span.End()
+
+	deadline := time.Now().Add(c.duration)
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+
+	// Check immediately
+	if !c.fn() {
+		err := fmt.Errorf("condition was false at start")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			if !c.fn() {
+				err := fmt.Errorf("condition became false after %v", time.Since(deadline.Add(-c.duration)))
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return err
+			}
+			if time.Now().After(deadline) {
+				return nil // success - condition stayed true
+			}
+		}
+	}
+}
