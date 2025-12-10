@@ -2333,3 +2333,125 @@ func (c *ConsistentlyBuilder) Wait() error {
 		}
 	}
 }
+
+// ============================================================================
+// Test Scenarios
+// ============================================================================
+
+// SelfHealTest provides a fluent API for self-healing tests.
+type SelfHealTest struct {
+	ctx             *Context
+	resource        string
+	deploymentName  string
+	err             error
+	recoveryTimeout time.Duration
+}
+
+// TestSelfHealing runs a self-healing test on a deployment.
+func (c *Context) TestSelfHealing(resource string, fn func(*SelfHealTest)) error {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+		return fmt.Errorf("TestSelfHealing requires deployment/name format")
+	}
+
+	test := &SelfHealTest{
+		ctx:             c,
+		resource:        resource,
+		deploymentName:  parts[1],
+		recoveryTimeout: 60 * time.Second,
+	}
+
+	fn(test)
+	return test.err
+}
+
+// KillPod kills one pod from the deployment.
+func (s *SelfHealTest) KillPod() {
+	if s.err != nil {
+		return
+	}
+
+	// Find a pod from this deployment
+	pods, err := s.ctx.Client.CoreV1().Pods(s.ctx.Namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", s.deploymentName),
+	})
+	if err != nil {
+		s.err = fmt.Errorf("failed to list pods: %w", err)
+		return
+	}
+	if len(pods.Items) == 0 {
+		s.err = fmt.Errorf("no pods found for deployment %s", s.deploymentName)
+		return
+	}
+
+	// Kill the first pod
+	podName := pods.Items[0].Name
+	s.err = s.ctx.Kill("pod/" + podName)
+}
+
+// ExpectRecoveryWithin sets the expected recovery time and waits.
+func (s *SelfHealTest) ExpectRecoveryWithin(timeout time.Duration) {
+	if s.err != nil {
+		return
+	}
+
+	s.recoveryTimeout = timeout
+	s.err = s.ctx.WaitReadyTimeout(s.resource, timeout)
+}
+
+// ScaleTest provides a fluent API for scaling tests.
+type ScaleTest struct {
+	ctx            *Context
+	resource       string
+	deploymentName string
+	err            error
+}
+
+// TestScaling runs a scaling test on a deployment.
+func (c *Context) TestScaling(resource string, fn func(*ScaleTest)) error {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+		return fmt.Errorf("TestScaling requires deployment/name format")
+	}
+
+	test := &ScaleTest{
+		ctx:            c,
+		resource:       resource,
+		deploymentName: parts[1],
+	}
+
+	fn(test)
+	return test.err
+}
+
+// ScaleTo scales the deployment to n replicas.
+func (s *ScaleTest) ScaleTo(n int) {
+	if s.err != nil {
+		return
+	}
+
+	deploy, err := s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Get(
+		context.Background(), s.deploymentName, metav1.GetOptions{})
+	if err != nil {
+		s.err = fmt.Errorf("failed to get deployment: %w", err)
+		return
+	}
+
+	replicas := int32(n)
+	deploy.Spec.Replicas = &replicas
+
+	_, err = s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Update(
+		context.Background(), deploy, metav1.UpdateOptions{})
+	if err != nil {
+		s.err = fmt.Errorf("failed to scale deployment: %w", err)
+	}
+}
+
+// WaitStable waits for the deployment to be stable at current replica count.
+func (s *ScaleTest) WaitStable() {
+	if s.err != nil {
+		return
+	}
+
+	s.err = s.ctx.WaitReadyTimeout(s.resource, 60*time.Second)
+}

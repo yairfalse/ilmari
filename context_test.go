@@ -1507,3 +1507,71 @@ func TestWaitErrorHasDiagnostics(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Test Scenarios Tests
+// ============================================================================
+
+// TestSelfHealingScenario verifies TestSelfHealing works.
+func TestSelfHealingScenario(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("heal-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Port(80).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("deployment/heal-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Run self-healing test
+		err := ctx.TestSelfHealing("deployment/heal-test", func(s *SelfHealTest) {
+			s.KillPod()
+			s.ExpectRecoveryWithin(60 * time.Second)
+		})
+		if err != nil {
+			t.Fatalf("TestSelfHealing failed: %v", err)
+		}
+	})
+}
+
+// TestScalingScenario verifies TestScaling works.
+func TestScalingScenario(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("scale-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Port(80).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("deployment/scale-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Run scaling test
+		err := ctx.TestScaling("deployment/scale-test", func(s *ScaleTest) {
+			s.ScaleTo(2)
+			s.WaitStable()
+			s.ScaleTo(1)
+			s.WaitStable()
+		})
+		if err != nil {
+			t.Fatalf("TestScaling failed: %v", err)
+		}
+	})
+}
