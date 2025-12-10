@@ -2197,12 +2197,12 @@ func (f *FixtureBuilder) WithReplicas(n int) *FixtureBuilder {
 	return f
 }
 
-// Build returns the Deployment (or panics on error).
-func (f *FixtureBuilder) Build() *appsv1.Deployment {
+// Build returns the Deployment, or an error if one occurred during building.
+func (f *FixtureBuilder) Build() (*appsv1.Deployment, error) {
 	if f.err != nil {
-		panic(f.err)
+		return nil, f.err
 	}
-	return f.deploy
+	return f.deploy, nil
 }
 
 // ============================================================================
