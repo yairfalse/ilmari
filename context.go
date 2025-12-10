@@ -2590,23 +2590,24 @@ func (t *Traffic) ErrorRate() float64 {
 // P99Latency returns the 99th percentile latency.
 func (t *Traffic) P99Latency() time.Duration {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if len(t.latencies) == 0 {
+		t.mu.Unlock()
 		return 0
 	}
+	// Copy the slice while holding the lock
+	latenciesCopy := make([]time.Duration, len(t.latencies))
+	copy(latenciesCopy, t.latencies)
+	t.mu.Unlock()
 
-	// Copy and sort
-	sorted := make([]time.Duration, len(t.latencies))
-	copy(sorted, t.latencies)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
+	// Sort the copy
+	sort.Slice(latenciesCopy, func(i, j int) bool {
+		return latenciesCopy[i] < latenciesCopy[j]
 	})
 
 	// Get 99th percentile index
-	idx := int(float64(len(sorted)) * 0.99)
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
+	idx := int(float64(len(latenciesCopy)) * 0.99)
+	if idx >= len(latenciesCopy) {
+		idx = len(latenciesCopy) - 1
 	}
-	return sorted[idx]
+	return latenciesCopy[idx]
 }
