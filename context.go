@@ -2097,8 +2097,14 @@ func (d *DeploymentBuilder) WithProbes() *DeploymentBuilder {
 func (d *DeploymentBuilder) Build() *appsv1.Deployment {
 	// Build env vars
 	var envVars []corev1.EnvVar
-	for k, v := range d.env {
-		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
+	// Sort env keys for deterministic output
+	keys := make([]string, 0, len(d.env))
+	for k := range d.env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: d.env[k]})
 	}
 
 	container := corev1.Container{
