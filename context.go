@@ -706,7 +706,11 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 					ps.Reason = cs.State.Waiting.Reason
 					// Add hints for common issues
 					if strings.Contains(ps.Reason, "ImagePull") {
-						waitErr.Hint = fmt.Sprintf("Image %q may not exist. Did you forget to build/push?", pod.Spec.Containers[0].Image)
+						imageName := "<unknown>"
+						if len(pod.Spec.Containers) > 0 {
+							imageName = pod.Spec.Containers[0].Image
+						}
+						waitErr.Hint = fmt.Sprintf("Image %q may not exist. Did you forget to build/push?", imageName)
 					}
 					if ps.Reason == "CrashLoopBackOff" {
 						waitErr.Hint = "Container is crash-looping. Check logs for errors."
