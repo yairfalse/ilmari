@@ -1,21 +1,33 @@
 # Ilmari
 
-Go Kubernetes SDK. Native library. No config files. Just code.
+Go SDK for Kubernetes. Define infrastructure in code, not YAML.
+
+## Why?
+
+We got tired of:
+- YAML files scattered everywhere
+- Helm charts we can't debug
+- kubectl scripts held together with bash
+- "Infrastructure as Code" that's actually "Infrastructure as Config Files"
+
+Ilmari lets you work with Kubernetes using actual code. Go code. With types, IDE support, and the full power of a real programming language.
 
 ```go
-// Standalone usage - no test framework required
 ctx, _ := ilmari.NewContext()
 defer ctx.Close()
 
-ctx.Apply(myDeployment)
-ctx.WaitReady("deployment/myapp")
+// This is a Deployment. In Go. With autocomplete.
+deploy := ilmari.Deployment("api").
+    Image("myapp:v1").
+    Replicas(3).
+    Port(8080).
+    Build()
 
-pf := ctx.Forward("svc/myapp", 8080)
-defer pf.Close()
-resp, _ := pf.Get("/health")
+ctx.Apply(deploy)
+ctx.WaitReady("deployment/api")
 ```
 
-Like client-go gives you API access, ilmari gives you operations.
+No YAML. No templates. No string interpolation. Just code.
 
 ## Install
 
@@ -23,147 +35,105 @@ Like client-go gives you API access, ilmari gives you operations.
 go get github.com/yairfalse/ilmari
 ```
 
-## Usage Modes
+## Examples
 
-### Standalone SDK
+### Deploy and verify
 
 ```go
-// Create context with isolated namespace (auto-cleaned on Close)
-ctx, err := ilmari.NewContext()
+ctx, _ := ilmari.NewContext()
 defer ctx.Close()
 
-// Or use an existing namespace (not deleted on Close)
-ctx, err := ilmari.NewContext(ilmari.WithNamespace("production"))
-defer ctx.Close()
+ctx.Apply(myDeployment)
+ctx.WaitReady("deployment/myapp")
 
-// Or isolated with custom prefix
-ctx, err := ilmari.NewContext(ilmari.WithIsolatedNamespace("myapp"))
-// Creates "myapp-a1b2c3d4", deleted on Close()
+// Port forward and check health
+pf := ctx.Forward("svc/myapp", 8080)
+defer pf.Close()
+resp, _ := pf.Get("/health")
 ```
 
-### Test Integration
+### Integration tests
 
 ```go
 func TestMyController(t *testing.T) {
     ilmari.Run(t, func(ctx *ilmari.Context) {
         ctx.Apply(myDeployment)
         ctx.WaitReady("deployment/myapp")
-        // Namespace auto-cleaned on success, kept on failure
+
+        // Test your stuff
+        // Namespace auto-cleaned on success, kept on failure for debugging
     })
 }
 ```
 
-## Features
-
-### Resource Operations
-
-```go
-// Apply (create or update)
-ctx.Apply(deployment)
-ctx.Apply(configMap)
-
-// Get
-pod := &corev1.Pod{}
-ctx.Get("my-pod", pod)
-
-// Delete
-ctx.Delete("my-pod", &corev1.Pod{})
-
-// List
-pods := &corev1.PodList{}
-ctx.List(pods)
-```
-
-### Stack Builder
-
-Deploy multi-service stacks:
+### Multi-service stack
 
 ```go
 stack := ilmari.NewStack().
     Service("api").Image("myapp:v1").Port(8080).Replicas(2).
     Service("db").Image("postgres:15").Port(5432).
+    Service("redis").Image("redis:7").Port(6379).
     Build()
 
-ctx.Up(stack) // Deploys all and waits for ready
+ctx.Up(stack) // Deploys all, waits for ready
 ```
 
-### Fluent Deployment Builder
+### Work with existing namespaces
 
 ```go
-deploy := ilmari.Deployment("myapp").
-    Image("nginx:alpine").
-    Replicas(3).
-    Port(80).
-    WithProbes().
-    Build()
+// Create isolated namespace (cleaned up on Close)
+ctx, _ := ilmari.NewContext()
 
-ctx.Apply(deploy)
+// Use existing namespace (never deleted)
+ctx, _ := ilmari.NewContext(ilmari.WithNamespace("production"))
+
+// Isolated with custom prefix
+ctx, _ := ilmari.NewContext(ilmari.WithIsolatedNamespace("mytest"))
+// Creates "mytest-a1b2c3d4", deleted on Close()
 ```
 
-### Wait Operations
+## What you can do
 
 ```go
+// Resources
+ctx.Apply(obj)              // Create or update
+ctx.Get("name", &obj)       // Fetch into typed object
+ctx.Delete("name", &obj)    // Remove
+ctx.List(&objList)          // List all
+
+// Wait for things
 ctx.WaitReady("deployment/myapp")
-ctx.WaitReadyTimeout("pod/myapp", 2*time.Minute)
-
-// Custom condition
 ctx.WaitFor("pod/myapp", func(obj interface{}) bool {
-    pod := obj.(*corev1.Pod)
-    return pod.Status.PodIP != ""
+    return obj.(*corev1.Pod).Status.PodIP != ""
 })
 
-// Flakiness protection
-ctx.Eventually(func() bool {
-    return checkCondition()
-}).Within(30 * time.Second).Wait()
+// Interact with pods
+ctx.Forward("svc/myapp", 8080)              // Port forward
+ctx.Exec("mypod", []string{"ls", "-la"})    // Run commands
+ctx.Logs("mypod")                           // Get logs
 
-ctx.Consistently(func() bool {
-    return staysTrue()
-}).For(10 * time.Second).Wait()
-```
+// Test helpers
+ctx.Eventually(checkFunc).Within(30 * time.Second).Wait()
+ctx.Consistently(checkFunc).For(10 * time.Second).Wait()
 
-### Port Forwarding & Exec
-
-```go
-pf := ctx.Forward("svc/myapp", 8080)
-defer pf.Close()
-resp, _ := pf.Get("/health")
-
-output, _ := ctx.Exec("my-pod", []string{"cat", "/etc/config"})
-logs, _ := ctx.Logs("my-pod")
-```
-
-### Assertions
-
-```go
-err := ctx.Assert("deployment/myapp").
-    HasReplicas(3).
-    IsProgressing().
-    Error()
-
-ctx.Assert("pod/myapp").HasNoRestarts().NoOOMKills().Must()
-```
-
-### Chaos Testing
-
-```go
+// Chaos
 ctx.Kill("pod/myapp-xyz")
-ctx.Isolate(map[string]string{"app": "myapp"}) // Network isolation
+ctx.Isolate(map[string]string{"app": "myapp"})
 ```
 
-## Namespace Policies
+## Philosophy
 
-| Mode | Creation | Cleanup | Use Case |
-|------|----------|---------|----------|
-| `NewContext()` | Creates `ilmari-xxxxx` | Deleted on `Close()` | Default, isolated |
-| `WithNamespace("prod")` | Uses existing | Never deleted | Production, shared |
-| `WithIsolatedNamespace("test")` | Creates `test-xxxxx` | Deleted on `Close()` | Custom prefix |
+**Code over config.** YAML is a data format that accidentally became a programming language. We'd rather use an actual programming language.
+
+**Native, not wrapped.** Ilmari uses client-go directly. No shelling out to kubectl, no external dependencies.
+
+**Honest errors.** When something fails, you get real diagnostics—pod states, events, logs—not just "timeout waiting for resource".
 
 ## Requirements
 
 - Go 1.21+
-- Kubernetes cluster (kind, minikube, or real cluster)
-- Valid kubeconfig (`~/.kube/config`)
+- A Kubernetes cluster (kind, minikube, or real)
+- kubeconfig (`~/.kube/config`)
 
 ## Family
 
@@ -172,8 +142,11 @@ ctx.Isolate(map[string]string{"app": "myapp"}) // Network isolation
 | Rust | [seppo](https://github.com/yairfalse/seppo) | kube-rs |
 | Go | **ilmari** | client-go |
 
-Seppo and Ilmari are both smith gods in Finnish mythology (Kalevala).
-Same concepts, native implementations.
+Seppo and Ilmari are smith gods from Finnish mythology (Kalevala). Same ideas, native implementations for each language.
+
+## Status
+
+Early. The API works but will evolve. We use it for our own projects.
 
 ## License
 
