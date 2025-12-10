@@ -558,6 +558,66 @@ func (c *Context) getResource(kind, name string) (interface{}, error) {
 	}
 }
 
+// WaitError provides rich diagnostic information when a wait operation fails.
+type WaitError struct {
+	Resource string
+	Expected string
+	Actual   string
+	Pods     []PodStatus
+	Events   []string
+	Hint     string
+}
+
+// PodStatus represents a pod's status for diagnostics.
+type PodStatus struct {
+	Name   string
+	Phase  string
+	Reason string
+	Ready  bool
+}
+
+// Error implements the error interface with rich formatting.
+func (e *WaitError) Error() string {
+	var b strings.Builder
+	b.WriteString("\n━━━ WAIT TIMEOUT ━━━\n")
+	b.WriteString(fmt.Sprintf("Resource: %s\n", e.Resource))
+	if e.Expected != "" {
+		b.WriteString(fmt.Sprintf("Expected: %s\n", e.Expected))
+	}
+	if e.Actual != "" {
+		b.WriteString(fmt.Sprintf("Actual:   %s\n", e.Actual))
+	}
+
+	if len(e.Pods) > 0 {
+		b.WriteString("\nPods:\n")
+		for _, p := range e.Pods {
+			readyStr := ""
+			if p.Ready {
+				readyStr = " (Ready)"
+			}
+			if p.Reason != "" {
+				b.WriteString(fmt.Sprintf("  %s  %s → %s%s\n", p.Name, p.Phase, p.Reason, readyStr))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s  %s%s\n", p.Name, p.Phase, readyStr))
+			}
+		}
+	}
+
+	if len(e.Events) > 0 {
+		b.WriteString("\nEvents:\n")
+		for _, ev := range e.Events {
+			b.WriteString(fmt.Sprintf("  %s\n", ev))
+		}
+	}
+
+	if e.Hint != "" {
+		b.WriteString(fmt.Sprintf("\nHint: %s\n", e.Hint))
+	}
+
+	b.WriteString("━━━━━━━━━━━━━━━━━━━\n")
+	return b.String()
+}
+
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
 func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.WaitReady",
@@ -598,11 +658,79 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err 
 
 		select {
 		case <-ctx.Done():
-			err = fmt.Errorf("timeout waiting for %s to be ready", resource)
+			err = c.buildWaitError(resource, kind, name)
 			return err
 		case <-ticker.C:
 		}
 	}
+}
+
+// buildWaitError creates a rich error with diagnostics.
+func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
+	waitErr := &WaitError{
+		Resource: resource,
+	}
+
+	bgCtx := context.Background()
+
+	// Get deployment status if applicable
+	if kind == "deployment" {
+		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(bgCtx, name, metav1.GetOptions{})
+		if err == nil {
+			var desired int32 = 1
+			if deploy.Spec.Replicas != nil {
+				desired = *deploy.Spec.Replicas
+			}
+			waitErr.Expected = fmt.Sprintf("ReadyReplicas >= %d", desired)
+			waitErr.Actual = fmt.Sprintf("ReadyReplicas = %d", deploy.Status.ReadyReplicas)
+		}
+	}
+
+	// Get pod statuses
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(bgCtx, metav1.ListOptions{})
+	if err == nil {
+		for _, pod := range pods.Items {
+			ps := PodStatus{
+				Name:  pod.Name,
+				Phase: string(pod.Status.Phase),
+			}
+
+			// Check container statuses for more details
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.Ready {
+					ps.Ready = true
+				}
+				if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+					ps.Reason = cs.State.Waiting.Reason
+					// Add hints for common issues
+					if strings.Contains(ps.Reason, "ImagePull") {
+						waitErr.Hint = fmt.Sprintf("Image %q may not exist. Did you forget to build/push?", pod.Spec.Containers[0].Image)
+					}
+					if ps.Reason == "CrashLoopBackOff" {
+						waitErr.Hint = "Container is crash-looping. Check logs for errors."
+					}
+				}
+			}
+
+			waitErr.Pods = append(waitErr.Pods, ps)
+		}
+	}
+
+	// Get recent events
+	events, err := c.Events()
+	if err == nil {
+		for _, ev := range events {
+			if ev.Type == "Warning" || ev.Reason == "Failed" || ev.Reason == "BackOff" {
+				waitErr.Events = append(waitErr.Events, fmt.Sprintf("%s %s: %s", ev.InvolvedObject.Name, ev.Reason, ev.Message))
+			}
+		}
+		// Limit to last 5 events
+		if len(waitErr.Events) > 5 {
+			waitErr.Events = waitErr.Events[len(waitErr.Events)-5:]
+		}
+	}
+
+	return waitErr
 }
 
 // isReady checks if a resource is ready based on its type.

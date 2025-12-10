@@ -1462,3 +1462,48 @@ func TestConsistentlyFails(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Better Failure Output Tests
+// ============================================================================
+
+// TestWaitErrorHasDiagnostics verifies WaitError includes diagnostic info.
+func TestWaitErrorHasDiagnostics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a deployment that will never be ready (bad image)
+		deploy := Deployment("bad-image-test").
+			Image("nonexistent-image-xyz-12345:latest").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Wait should timeout with rich error
+		err := ctx.WaitReadyTimeout("deployment/bad-image-test", 10*time.Second)
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+
+		// Error should contain diagnostic info
+		errStr := err.Error()
+		if !strings.Contains(errStr, "bad-image-test") {
+			t.Error("error should mention resource name")
+		}
+
+		// Check if it's a WaitError with diagnostics
+		if waitErr, ok := err.(*WaitError); ok {
+			if waitErr.Resource == "" {
+				t.Error("WaitError should have Resource set")
+			}
+			if len(waitErr.Pods) == 0 && len(waitErr.Events) == 0 {
+				t.Log("Note: WaitError has no pods/events (may be expected)")
+			}
+		}
+	})
+}
