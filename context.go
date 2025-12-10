@@ -21,7 +21,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,6 +42,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
@@ -53,7 +56,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Context provides a Kubernetes connection with an isolated namespace for testing.
+// Context provides a Kubernetes connection for SDK operations.
 type Context struct {
 	// Client is the Kubernetes clientset
 	Client *kubernetes.Clientset
@@ -61,10 +64,10 @@ type Context struct {
 	// Dynamic is the dynamic client for CRDs and unstructured resources
 	Dynamic dynamic.Interface
 
-	// Namespace is the isolated test namespace
+	// Namespace is the working namespace
 	Namespace string
 
-	// t is the test instance for logging
+	// t is the test instance for logging (optional, nil for standalone usage)
 	t *testing.T
 
 	// tracer for OpenTelemetry tracing (optional)
@@ -72,6 +75,12 @@ type Context struct {
 
 	// mapper for GVK to GVR discovery
 	mapper *restmapper.DeferredDiscoveryRESTMapper
+
+	// ownsNamespace tracks whether Close() should delete the namespace
+	ownsNamespace bool
+
+	// restConfig is stored for operations that need it
+	restConfig *rest.Config
 }
 
 // Config configures the test context behavior.
@@ -95,6 +104,159 @@ func DefaultConfig() Config {
 	return Config{
 		KeepOnFailure: true,
 		KeepAlways:    os.Getenv("ILMARI_KEEP_ALL") == "true",
+	}
+}
+
+// ============================================================================
+// Standalone SDK Usage (no test wrapper required)
+// ============================================================================
+
+// ContextOption configures a Context.
+type ContextOption func(*contextOptions)
+
+// contextOptions holds configuration for NewContext.
+type contextOptions struct {
+	kubeconfig        string
+	namespace         string // use existing namespace (shared)
+	isolatedPrefix    string // create isolated namespace with prefix
+	tracerProvider    trace.TracerProvider
+}
+
+// WithKubeconfig sets a custom kubeconfig path.
+func WithKubeconfig(path string) ContextOption {
+	return func(o *contextOptions) {
+		o.kubeconfig = path
+	}
+}
+
+// WithNamespace uses an existing namespace (shared mode).
+// The namespace will NOT be deleted on Close().
+func WithNamespace(ns string) ContextOption {
+	return func(o *contextOptions) {
+		o.namespace = ns
+		o.isolatedPrefix = "" // clear isolated if set
+	}
+}
+
+// WithIsolatedNamespace creates a new namespace with the given prefix.
+// A random suffix is appended. The namespace IS deleted on Close().
+func WithIsolatedNamespace(prefix string) ContextOption {
+	return func(o *contextOptions) {
+		o.isolatedPrefix = prefix
+		o.namespace = "" // clear shared if set
+	}
+}
+
+// WithTracerProvider sets a custom OpenTelemetry tracer provider.
+func WithTracerProvider(tp trace.TracerProvider) ContextOption {
+	return func(o *contextOptions) {
+		o.tracerProvider = tp
+	}
+}
+
+// NewContext creates a new Context for standalone SDK usage.
+// By default, creates an isolated namespace that is deleted on Close().
+//
+// Examples:
+//
+//	ctx, _ := ilmari.NewContext()                              // isolated, auto-cleanup
+//	ctx, _ := ilmari.NewContext(ilmari.WithNamespace("prod"))  // shared, no cleanup
+//	ctx, _ := ilmari.NewContext(ilmari.WithIsolatedNamespace("mytest")) // isolated with prefix
+func NewContext(opts ...ContextOption) (*Context, error) {
+	options := &contextOptions{
+		isolatedPrefix: "ilmari", // default: create isolated namespace
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	// Load kubeconfig
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if options.kubeconfig != "" {
+		loadingRules.ExplicitPath = options.kubeconfig
+	}
+
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	// Create clientset
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	// Create dynamic client for CRDs
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Create discovery client and REST mapper
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(
+		&cachedDiscovery{DiscoveryInterface: discoveryClient},
+	)
+
+	// Initialize tracer
+	var tracer trace.Tracer
+	if options.tracerProvider != nil {
+		tracer = options.tracerProvider.Tracer("ilmari")
+	} else {
+		tracer = otel.Tracer("ilmari")
+	}
+
+	ctx := &Context{
+		Client:     client,
+		Dynamic:    dynamicClient,
+		tracer:     tracer,
+		mapper:     mapper,
+		restConfig: config,
+	}
+
+	// Handle namespace: shared vs isolated
+	if options.namespace != "" {
+		// Shared mode: use existing namespace, don't delete on close
+		ctx.Namespace = options.namespace
+		ctx.ownsNamespace = false
+	} else {
+		// Isolated mode: create new namespace with random suffix
+		id := uuid.New().String()[:8]
+		ctx.Namespace = fmt.Sprintf("%s-%s", options.isolatedPrefix, id)
+		ctx.ownsNamespace = true
+
+		// Create namespace
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: ctx.Namespace,
+				Labels: map[string]string{
+					"ilmari.io/managed": "true",
+				},
+			},
+		}
+
+		_, err = client.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create namespace: %w", err)
+		}
+	}
+
+	return ctx, nil
+}
+
+// Close cleans up the Context.
+// For isolated namespaces, this deletes the namespace.
+// For shared namespaces, this is a no-op.
+func (c *Context) Close() {
+	if c.ownsNamespace {
+		_ = c.cleanup()
 	}
 }
 
@@ -196,12 +358,14 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 	}
 
 	return &Context{
-		Client:    client,
-		Dynamic:   dynamicClient,
-		Namespace: namespace,
-		t:         t,
-		tracer:    tracer,
-		mapper:    mapper,
+		Client:        client,
+		Dynamic:       dynamicClient,
+		Namespace:     namespace,
+		t:             t,
+		tracer:        tracer,
+		mapper:        mapper,
+		ownsNamespace: true,
+		restConfig:    config,
 	}, nil
 }
 
@@ -558,6 +722,66 @@ func (c *Context) getResource(kind, name string) (interface{}, error) {
 	}
 }
 
+// WaitError provides rich diagnostic information when a wait operation fails.
+type WaitError struct {
+	Resource string
+	Expected string
+	Actual   string
+	Pods     []PodStatus
+	Events   []string
+	Hint     string
+}
+
+// PodStatus represents a pod's status for diagnostics.
+type PodStatus struct {
+	Name   string
+	Phase  string
+	Reason string
+	Ready  bool
+}
+
+// Error implements the error interface with rich formatting.
+func (e *WaitError) Error() string {
+	var b strings.Builder
+	b.WriteString("\n━━━ WAIT TIMEOUT ━━━\n")
+	b.WriteString(fmt.Sprintf("Resource: %s\n", e.Resource))
+	if e.Expected != "" {
+		b.WriteString(fmt.Sprintf("Expected: %s\n", e.Expected))
+	}
+	if e.Actual != "" {
+		b.WriteString(fmt.Sprintf("Actual:   %s\n", e.Actual))
+	}
+
+	if len(e.Pods) > 0 {
+		b.WriteString("\nPods:\n")
+		for _, p := range e.Pods {
+			readyStr := ""
+			if p.Ready {
+				readyStr = " (Ready)"
+			}
+			if p.Reason != "" {
+				b.WriteString(fmt.Sprintf("  %s  %s → %s%s\n", p.Name, p.Phase, p.Reason, readyStr))
+			} else {
+				b.WriteString(fmt.Sprintf("  %s  %s%s\n", p.Name, p.Phase, readyStr))
+			}
+		}
+	}
+
+	if len(e.Events) > 0 {
+		b.WriteString("\nEvents:\n")
+		for _, ev := range e.Events {
+			b.WriteString(fmt.Sprintf("  %s\n", ev))
+		}
+	}
+
+	if e.Hint != "" {
+		b.WriteString(fmt.Sprintf("\nHint: %s\n", e.Hint))
+	}
+
+	b.WriteString("━━━━━━━━━━━━━━━━━━━\n")
+	return b.String()
+}
+
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
 func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.WaitReady",
@@ -598,11 +822,95 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err 
 
 		select {
 		case <-ctx.Done():
-			err = fmt.Errorf("timeout waiting for %s to be ready", resource)
+			err = c.buildWaitError(resource, kind, name)
 			return err
 		case <-ticker.C:
 		}
 	}
+}
+
+// buildWaitError creates a rich error with diagnostics.
+func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
+	waitErr := &WaitError{
+		Resource: resource,
+	}
+
+	bgCtx := context.Background()
+
+	// Build label selector for filtering pods
+	var labelSelector string
+
+	// Get deployment status if applicable
+	if kind == "deployment" {
+		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(bgCtx, name, metav1.GetOptions{})
+		if err == nil {
+			var desired int32 = 1
+			if deploy.Spec.Replicas != nil {
+				desired = *deploy.Spec.Replicas
+			}
+			waitErr.Expected = fmt.Sprintf("ReadyReplicas >= %d", desired)
+			waitErr.Actual = fmt.Sprintf("ReadyReplicas = %d", deploy.Status.ReadyReplicas)
+
+			// Extract label selector from deployment
+			if deploy.Spec.Selector != nil && deploy.Spec.Selector.MatchLabels != nil {
+				labelSelector = labels.SelectorFromSet(deploy.Spec.Selector.MatchLabels).String()
+			}
+		}
+	}
+
+	// Get pod statuses (filtered by label selector if available)
+	listOpts := metav1.ListOptions{}
+	if labelSelector != "" {
+		listOpts.LabelSelector = labelSelector
+	}
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(bgCtx, listOpts)
+	if err == nil {
+		for _, pod := range pods.Items {
+			ps := PodStatus{
+				Name:  pod.Name,
+				Phase: string(pod.Status.Phase),
+			}
+
+			// Check container statuses for more details
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.Ready {
+					ps.Ready = true
+				}
+				if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+					ps.Reason = cs.State.Waiting.Reason
+					// Add hints for common issues
+					if strings.Contains(ps.Reason, "ImagePull") {
+						imageName := "<unknown>"
+						if len(pod.Spec.Containers) > 0 {
+							imageName = pod.Spec.Containers[0].Image
+						}
+						waitErr.Hint = fmt.Sprintf("Image %q may not exist. Did you forget to build/push?", imageName)
+					}
+					if ps.Reason == "CrashLoopBackOff" {
+						waitErr.Hint = "Container is crash-looping. Check logs for errors."
+					}
+				}
+			}
+
+			waitErr.Pods = append(waitErr.Pods, ps)
+		}
+	}
+
+	// Get recent events
+	events, err := c.Events()
+	if err == nil {
+		for _, ev := range events {
+			if ev.Type == "Warning" || ev.Reason == "Failed" || ev.Reason == "BackOff" {
+				waitErr.Events = append(waitErr.Events, fmt.Sprintf("%s %s: %s", ev.InvolvedObject.Name, ev.Reason, ev.Message))
+			}
+		}
+		// Limit to last 5 events
+		if len(waitErr.Events) > 5 {
+			waitErr.Events = waitErr.Events[len(waitErr.Events)-5:]
+		}
+	}
+
+	return waitErr
 }
 
 // isReady checks if a resource is ready based on its type.
@@ -796,19 +1104,23 @@ type PortForward struct {
 	httpClient *http.Client
 	err        error
 	span       trace.Span
+	closeOnce  sync.Once
 }
 
 // Close closes the port forward and waits for cleanup.
+// Safe to call multiple times.
 func (pf *PortForward) Close() {
-	if pf.stopChan != nil {
-		close(pf.stopChan)
-	}
-	if pf.doneChan != nil {
-		<-pf.doneChan
-	}
-	if pf.span != nil {
-		pf.span.End()
-	}
+	pf.closeOnce.Do(func() {
+		if pf.stopChan != nil {
+			close(pf.stopChan)
+		}
+		if pf.doneChan != nil {
+			<-pf.doneChan
+		}
+		if pf.span != nil {
+			pf.span.End()
+		}
+	})
 }
 
 // Get makes an HTTP GET request through the port forward.
@@ -1530,6 +1842,200 @@ func (a *Assertion) Must() {
 	}
 }
 
+// HasReplicas asserts the deployment/statefulset has the specified ready replicas.
+func (a *Assertion) HasReplicas(expected int) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+	ctx := context.Background()
+
+	var ready int32
+	switch kind {
+	case "deployment":
+		deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			a.err = err
+			return a
+		}
+		ready = deploy.Status.ReadyReplicas
+	case "statefulset":
+		ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			a.err = err
+			return a
+		}
+		ready = ss.Status.ReadyReplicas
+	default:
+		a.err = fmt.Errorf("HasReplicas: unsupported kind %s (use deployment or statefulset)", kind)
+		return a
+	}
+
+	if int(ready) != expected {
+		a.err = fmt.Errorf("expected %d ready replicas, got %d", expected, ready)
+	}
+	return a
+}
+
+// IsProgressing asserts the deployment is progressing (not stalled).
+func (a *Assertion) IsProgressing() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "deployment" {
+		a.err = fmt.Errorf("IsProgressing: only supports deployments, got %s", kind)
+		return a
+	}
+
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	// Check for Progressing condition
+	for _, cond := range deploy.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing {
+			if cond.Status == corev1.ConditionTrue {
+				return a // progressing
+			}
+			a.err = fmt.Errorf("deployment not progressing: %s", cond.Message)
+			return a
+		}
+	}
+
+	a.err = fmt.Errorf("deployment has no Progressing condition")
+	return a
+}
+
+// HasNoRestarts asserts the pod's containers have zero restarts.
+func (a *Assertion) HasNoRestarts() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pod" {
+		a.err = fmt.Errorf("HasNoRestarts: only supports pods, got %s", kind)
+		return a
+	}
+
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.RestartCount > 0 {
+			a.err = fmt.Errorf("container %s has %d restarts", cs.Name, cs.RestartCount)
+			return a
+		}
+	}
+	return a
+}
+
+// LogsContain asserts the pod's logs contain the specified text.
+func (a *Assertion) LogsContain(text string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pod" {
+		a.err = fmt.Errorf("LogsContain: only supports pods, got %s", kind)
+		return a
+	}
+
+	logs, err := a.ctx.Logs(name)
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	if !strings.Contains(logs, text) {
+		a.err = fmt.Errorf("logs do not contain %q", text)
+	}
+	return a
+}
+
+// NoOOMKills asserts the pod has no containers terminated due to OOM.
+func (a *Assertion) NoOOMKills() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pod" {
+		a.err = fmt.Errorf("NoOOMKills: only supports pods, got %s", kind)
+		return a
+	}
+
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.LastTerminationState.Terminated != nil {
+			if cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
+				a.err = fmt.Errorf("container %s was OOMKilled", cs.Name)
+				return a
+			}
+		}
+		if cs.State.Terminated != nil {
+			if cs.State.Terminated.Reason == "OOMKilled" {
+				a.err = fmt.Errorf("container %s was OOMKilled", cs.Name)
+				return a
+			}
+		}
+	}
+	return a
+}
+
 // ApplyCRD applies a custom resource using the dynamic client.
 func (c *Context) ApplyCRD(gvr schema.GroupVersionResource, obj *unstructured.Unstructured) (err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.ApplyCRD",
@@ -1703,4 +2209,596 @@ func (sb *ServiceBuilder) Resources(cpu, memory string) *ServiceBuilder {
 		corev1.ResourceMemory: resource.MustParse(memory),
 	}
 	return sb
+}
+
+// ============================================================================
+// Fluent Deployment Builder
+// ============================================================================
+
+// DeploymentBuilder provides a fluent API for building Deployments.
+type DeploymentBuilder struct {
+	name       string
+	image      string
+	replicas   int32
+	port       int32
+	env        map[string]string
+	command    []string
+	withProbes bool
+}
+
+// Deployment creates a new DeploymentBuilder with the given name.
+func Deployment(name string) *DeploymentBuilder {
+	return &DeploymentBuilder{
+		name:     name,
+		replicas: 1,
+		env:      make(map[string]string),
+	}
+}
+
+// Image sets the container image.
+func (d *DeploymentBuilder) Image(image string) *DeploymentBuilder {
+	d.image = image
+	return d
+}
+
+// Replicas sets the number of replicas.
+func (d *DeploymentBuilder) Replicas(n int) *DeploymentBuilder {
+	d.replicas = int32(n)
+	return d
+}
+
+// Port sets the container port.
+func (d *DeploymentBuilder) Port(port int) *DeploymentBuilder {
+	d.port = int32(port)
+	return d
+}
+
+// Env adds an environment variable.
+func (d *DeploymentBuilder) Env(key, value string) *DeploymentBuilder {
+	d.env[key] = value
+	return d
+}
+
+// Command sets the container command.
+func (d *DeploymentBuilder) Command(cmd ...string) *DeploymentBuilder {
+	d.command = cmd
+	return d
+}
+
+// WithProbes adds sensible default liveness and readiness probes.
+func (d *DeploymentBuilder) WithProbes() *DeploymentBuilder {
+	d.withProbes = true
+	return d
+}
+
+// Build creates the Deployment object.
+func (d *DeploymentBuilder) Build() *appsv1.Deployment {
+	// Build env vars
+	var envVars []corev1.EnvVar
+	// Sort env keys for deterministic output
+	keys := make([]string, 0, len(d.env))
+	for k := range d.env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: d.env[k]})
+	}
+
+	container := corev1.Container{
+		Name:    d.name,
+		Image:   d.image,
+		Command: d.command,
+		Env:     envVars,
+	}
+
+	if d.port > 0 {
+		container.Ports = []corev1.ContainerPort{{ContainerPort: d.port}}
+	}
+
+	if d.withProbes && d.port > 0 {
+		container.LivenessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt32(d.port),
+				},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+		}
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt32(d.port),
+				},
+			},
+			InitialDelaySeconds: 2,
+			PeriodSeconds:       5,
+		}
+	}
+
+	replicas := d.replicas
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: d.name,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": d.name},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": d.name},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{container},
+				},
+			},
+		},
+	}
+}
+
+// ============================================================================
+// Fixture Loading with Overrides
+// ============================================================================
+
+// FixtureBuilder loads YAML and allows overrides before applying.
+type FixtureBuilder struct {
+	deploy *appsv1.Deployment
+	err    error
+}
+
+// LoadFixture loads a Deployment from a YAML file.
+func (c *Context) LoadFixture(path string) *FixtureBuilder {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return &FixtureBuilder{err: fmt.Errorf("failed to read fixture: %w", err)}
+	}
+
+	var deploy appsv1.Deployment
+	if err := yaml.Unmarshal(data, &deploy); err != nil {
+		return &FixtureBuilder{err: fmt.Errorf("failed to parse fixture: %w", err)}
+	}
+
+	return &FixtureBuilder{deploy: &deploy}
+}
+
+// WithImage overrides the container image.
+func (f *FixtureBuilder) WithImage(image string) *FixtureBuilder {
+	if f.err != nil || f.deploy == nil {
+		return f
+	}
+	if len(f.deploy.Spec.Template.Spec.Containers) > 0 {
+		f.deploy.Spec.Template.Spec.Containers[0].Image = image
+	}
+	return f
+}
+
+// WithReplicas overrides the replica count.
+func (f *FixtureBuilder) WithReplicas(n int) *FixtureBuilder {
+	if f.err != nil || f.deploy == nil {
+		return f
+	}
+	replicas := int32(n)
+	f.deploy.Spec.Replicas = &replicas
+	return f
+}
+
+// Build returns the Deployment, or an error if one occurred during building.
+func (f *FixtureBuilder) Build() (*appsv1.Deployment, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.deploy, nil
+}
+
+// ============================================================================
+// Eventually/Consistently - Flakiness Protection
+// ============================================================================
+
+// EventuallyBuilder polls a condition until it becomes true or times out.
+type EventuallyBuilder struct {
+	ctx      *Context
+	fn       func() bool
+	timeout  time.Duration
+	interval time.Duration
+}
+
+// Eventually creates an EventuallyBuilder that waits for a condition.
+func (c *Context) Eventually(fn func() bool) *EventuallyBuilder {
+	return &EventuallyBuilder{
+		ctx:      c,
+		fn:       fn,
+		timeout:  30 * time.Second, // default
+		interval: 1 * time.Second,  // default
+	}
+}
+
+// Within sets the maximum time to wait.
+func (e *EventuallyBuilder) Within(timeout time.Duration) *EventuallyBuilder {
+	e.timeout = timeout
+	return e
+}
+
+// ProbeEvery sets the polling interval.
+func (e *EventuallyBuilder) ProbeEvery(interval time.Duration) *EventuallyBuilder {
+	e.interval = interval
+	return e
+}
+
+// Wait blocks until the condition is true or timeout is reached.
+func (e *EventuallyBuilder) Wait() error {
+	_, span := e.ctx.startSpan(context.Background(), "ilmari.Eventually",
+		attribute.Int64("timeout_ms", e.timeout.Milliseconds()),
+		attribute.Int64("interval_ms", e.interval.Milliseconds()))
+	defer span.End()
+
+	deadline := time.Now().Add(e.timeout)
+	ticker := time.NewTicker(e.interval)
+	defer ticker.Stop()
+
+	// Check immediately
+	if e.fn() {
+		return nil
+	}
+
+	for {
+		// Check deadline before waiting on ticker
+		if time.Now().After(deadline) {
+			err := fmt.Errorf("condition not met within %v", e.timeout)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+
+		select {
+		case <-ticker.C:
+			if e.fn() {
+				return nil
+			}
+		}
+	}
+}
+
+// ConsistentlyBuilder checks that a condition stays true for a duration.
+type ConsistentlyBuilder struct {
+	ctx      *Context
+	fn       func() bool
+	duration time.Duration
+	interval time.Duration
+}
+
+// Consistently creates a ConsistentlyBuilder that checks a condition stays true.
+func (c *Context) Consistently(fn func() bool) *ConsistentlyBuilder {
+	return &ConsistentlyBuilder{
+		ctx:      c,
+		fn:       fn,
+		duration: 5 * time.Second,  // default
+		interval: 500 * time.Millisecond, // default
+	}
+}
+
+// For sets how long the condition must stay true.
+func (c *ConsistentlyBuilder) For(duration time.Duration) *ConsistentlyBuilder {
+	c.duration = duration
+	return c
+}
+
+// ProbeEvery sets the checking interval.
+func (c *ConsistentlyBuilder) ProbeEvery(interval time.Duration) *ConsistentlyBuilder {
+	c.interval = interval
+	return c
+}
+
+// Wait blocks and checks the condition repeatedly for the duration.
+func (c *ConsistentlyBuilder) Wait() error {
+	_, span := c.ctx.startSpan(context.Background(), "ilmari.Consistently",
+		attribute.Int64("duration_ms", c.duration.Milliseconds()),
+		attribute.Int64("interval_ms", c.interval.Milliseconds()))
+	defer span.End()
+
+	deadline := time.Now().Add(c.duration)
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+
+	// Check immediately
+	if !c.fn() {
+		err := fmt.Errorf("condition was false at start")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			if !c.fn() {
+				err := fmt.Errorf("condition became false after %v", time.Since(deadline.Add(-c.duration)))
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return err
+			}
+			if time.Now().After(deadline) {
+				return nil // success - condition stayed true
+			}
+		}
+	}
+}
+
+// ============================================================================
+// Test Scenarios
+// ============================================================================
+
+// SelfHealTest provides a fluent API for self-healing tests.
+type SelfHealTest struct {
+	ctx             *Context
+	resource        string
+	deploymentName  string
+	err             error
+	recoveryTimeout time.Duration
+}
+
+// TestSelfHealing runs a self-healing test on a deployment.
+func (c *Context) TestSelfHealing(resource string, fn func(*SelfHealTest)) error {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+		return fmt.Errorf("TestSelfHealing requires deployment/name format")
+	}
+
+	test := &SelfHealTest{
+		ctx:             c,
+		resource:        resource,
+		deploymentName:  parts[1],
+		recoveryTimeout: 60 * time.Second,
+	}
+
+	fn(test)
+	return test.err
+}
+
+// KillPod kills one pod from the deployment.
+func (s *SelfHealTest) KillPod() {
+	if s.err != nil {
+		return
+	}
+
+	// Find a pod from this deployment
+	pods, err := s.ctx.Client.CoreV1().Pods(s.ctx.Namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", s.deploymentName),
+	})
+	if err != nil {
+		s.err = fmt.Errorf("failed to list pods: %w", err)
+		return
+	}
+	if len(pods.Items) == 0 {
+		s.err = fmt.Errorf("no pods found for deployment %s", s.deploymentName)
+		return
+	}
+
+	// Kill the first pod
+	podName := pods.Items[0].Name
+	s.err = s.ctx.Kill("pod/" + podName)
+}
+
+// ExpectRecoveryWithin sets the expected recovery time and waits.
+func (s *SelfHealTest) ExpectRecoveryWithin(timeout time.Duration) {
+	if s.err != nil {
+		return
+	}
+
+	s.recoveryTimeout = timeout
+	s.err = s.ctx.WaitReadyTimeout(s.resource, timeout)
+}
+
+// ScaleTest provides a fluent API for scaling tests.
+type ScaleTest struct {
+	ctx            *Context
+	resource       string
+	deploymentName string
+	err            error
+}
+
+// TestScaling runs a scaling test on a deployment.
+func (c *Context) TestScaling(resource string, fn func(*ScaleTest)) error {
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+		return fmt.Errorf("TestScaling requires deployment/name format")
+	}
+
+	test := &ScaleTest{
+		ctx:            c,
+		resource:       resource,
+		deploymentName: parts[1],
+	}
+
+	fn(test)
+	return test.err
+}
+
+// ScaleTo scales the deployment to n replicas.
+func (s *ScaleTest) ScaleTo(n int) {
+	if s.err != nil {
+		return
+	}
+
+	deploy, err := s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Get(
+		context.Background(), s.deploymentName, metav1.GetOptions{})
+	if err != nil {
+		s.err = fmt.Errorf("failed to get deployment: %w", err)
+		return
+	}
+
+	replicas := int32(n)
+	deploy.Spec.Replicas = &replicas
+
+	_, err = s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Update(
+		context.Background(), deploy, metav1.UpdateOptions{})
+	if err != nil {
+		s.err = fmt.Errorf("failed to scale deployment: %w", err)
+	}
+}
+
+// WaitStable waits for the deployment to be stable at current replica count.
+func (s *ScaleTest) WaitStable() {
+	if s.err != nil {
+		return
+	}
+
+	s.err = s.ctx.WaitReadyTimeout(s.resource, 60*time.Second)
+}
+
+// ============================================================================
+// Traffic Testing
+// ============================================================================
+
+// TrafficConfig configures traffic generation.
+type TrafficConfig struct {
+	rps      int
+	duration time.Duration
+	endpoint string
+}
+
+// RPS sets the requests per second.
+func (t *TrafficConfig) RPS(n int) {
+	t.rps = n
+}
+
+// Duration sets how long to generate traffic.
+func (t *TrafficConfig) Duration(d time.Duration) {
+	t.duration = d
+}
+
+// Endpoint sets the HTTP endpoint to hit.
+func (t *TrafficConfig) Endpoint(path string) {
+	t.endpoint = path
+}
+
+// Traffic represents an ongoing or completed traffic test.
+type Traffic struct {
+	ctx       *Context
+	pf        *PortForward
+	config    TrafficConfig
+	done      chan struct{}
+	mu        sync.Mutex
+	total     int64
+	errors    int64
+	latencies []time.Duration
+}
+
+// StartTraffic starts generating HTTP traffic to a service.
+func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffic {
+	config := TrafficConfig{
+		rps:      10,
+		duration: 10 * time.Second,
+		endpoint: "/",
+	}
+	fn(&config)
+
+	// Set up port forward
+	pf := c.Forward(resource, 80)
+
+	traffic := &Traffic{
+		ctx:       c,
+		pf:        pf,
+		config:    config,
+		done:      make(chan struct{}),
+		latencies: make([]time.Duration, 0, config.rps*int(config.duration.Seconds())),
+	}
+
+	// Start traffic generation in background
+	go traffic.run()
+
+	return traffic
+}
+
+// run generates traffic in the background.
+func (t *Traffic) run() {
+	defer close(t.done)
+	defer t.pf.Close()
+
+	if t.pf.err != nil {
+		return
+	}
+
+	interval := time.Duration(float64(time.Second) / float64(t.config.rps))
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	deadline := time.Now().Add(t.config.duration)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for time.Now().Before(deadline) {
+		<-ticker.C
+
+		start := time.Now()
+		resp, err := client.Get(fmt.Sprintf("http://localhost:%d%s", t.pf.localPort, t.config.endpoint))
+		latency := time.Since(start)
+
+		t.mu.Lock()
+		t.total++
+		t.latencies = append(t.latencies, latency)
+		if err != nil || (resp != nil && resp.StatusCode >= 400) {
+			t.errors++
+		}
+		t.mu.Unlock()
+
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}
+}
+
+// Wait blocks until traffic generation completes.
+func (t *Traffic) Wait() {
+	<-t.done
+}
+
+// Stop stops traffic generation early.
+func (t *Traffic) Stop() {
+	t.pf.Close()
+	<-t.done
+}
+
+// TotalRequests returns the total number of requests made.
+func (t *Traffic) TotalRequests() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.total
+}
+
+// ErrorRate returns the fraction of failed requests (0.0 to 1.0).
+func (t *Traffic) ErrorRate() float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.total == 0 {
+		return 0
+	}
+	return float64(t.errors) / float64(t.total)
+}
+
+// P99Latency returns the 99th percentile latency.
+func (t *Traffic) P99Latency() time.Duration {
+	t.mu.Lock()
+	if len(t.latencies) == 0 {
+		t.mu.Unlock()
+		return 0
+	}
+	// Copy the slice while holding the lock
+	latenciesCopy := make([]time.Duration, len(t.latencies))
+	copy(latenciesCopy, t.latencies)
+	t.mu.Unlock()
+
+	// Sort the copy
+	sort.Slice(latenciesCopy, func(i, j int) bool {
+		return latenciesCopy[i] < latenciesCopy[j]
+	})
+
+	// Get 99th percentile index
+	idx := int(float64(len(latenciesCopy)) * 0.99)
+	if idx >= len(latenciesCopy) {
+		idx = len(latenciesCopy) - 1
+	}
+	return latenciesCopy[idx]
 }

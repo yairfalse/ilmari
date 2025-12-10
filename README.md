@@ -1,25 +1,21 @@
 # Ilmari
 
-Go Kubernetes testing library. Native library. No config files. Just code.
+Go Kubernetes SDK. Native library. No config files. Just code.
 
 ```go
-func TestMyController(t *testing.T) {
-    ilmari.Run(t, func(ctx *ilmari.Context) {
-        ctx.Apply(myDeployment)
-        ctx.WaitReady("deployment/myapp")
+// Standalone usage - no test framework required
+ctx, _ := ilmari.NewContext()
+defer ctx.Close()
 
-        resp := ctx.Forward("svc/myapp", 8080).Get("/health")
-        defer resp.Body.Close()
-        assert.Equal(t, 200, resp.StatusCode)
-    })
-}
+ctx.Apply(myDeployment)
+ctx.WaitReady("deployment/myapp")
+
+pf := ctx.Forward("svc/myapp", 8080)
+defer pf.Close()
+resp, _ := pf.Get("/health")
 ```
 
-```bash
-go test
-```
-
-Like testify gives you assertions, ilmari gives you Kubernetes.
+Like client-go gives you API access, ilmari gives you operations.
 
 ## Install
 
@@ -27,33 +23,37 @@ Like testify gives you assertions, ilmari gives you Kubernetes.
 go get github.com/yairfalse/ilmari
 ```
 
+## Usage Modes
+
+### Standalone SDK
+
+```go
+// Create context with isolated namespace (auto-cleaned on Close)
+ctx, err := ilmari.NewContext()
+defer ctx.Close()
+
+// Or use an existing namespace (not deleted on Close)
+ctx, err := ilmari.NewContext(ilmari.WithNamespace("production"))
+defer ctx.Close()
+
+// Or isolated with custom prefix
+ctx, err := ilmari.NewContext(ilmari.WithIsolatedNamespace("myapp"))
+// Creates "myapp-a1b2c3d4", deleted on Close()
+```
+
+### Test Integration
+
+```go
+func TestMyController(t *testing.T) {
+    ilmari.Run(t, func(ctx *ilmari.Context) {
+        ctx.Apply(myDeployment)
+        ctx.WaitReady("deployment/myapp")
+        // Namespace auto-cleaned on success, kept on failure
+    })
+}
+```
+
 ## Features
-
-### Stack Builder
-
-Deploy multi-service stacks with a fluent API:
-
-```go
-stack := ilmari.NewStack().
-    Service("api").Image("myapp:v1").Port(8080).Replicas(2).
-    Service("db").Image("postgres:15").Port(5432).
-    Service("worker").Image("myapp:v1").Command("worker").
-    Build()
-
-ctx.Up(stack) // Deploys all and waits for ready
-```
-
-### Isolated Namespaces
-
-Each test runs in its own namespace. Cleaned up on success, kept for debugging on failure.
-
-```go
-ilmari.Run(t, func(ctx *ilmari.Context) {
-    // ctx.Namespace = "ilmari-test-a1b2c3d4"
-})
-```
-
-Set `ILMARI_KEEP_ALL=true` to keep namespaces after all tests (for debugging).
 
 ### Resource Operations
 
@@ -61,7 +61,6 @@ Set `ILMARI_KEEP_ALL=true` to keep namespaces after all tests (for debugging).
 // Apply (create or update)
 ctx.Apply(deployment)
 ctx.Apply(configMap)
-ctx.Apply(secret)
 
 // Get
 pod := &corev1.Pod{}
@@ -75,16 +74,36 @@ pods := &corev1.PodList{}
 ctx.List(pods)
 ```
 
-Supported: Pod, Deployment, StatefulSet, DaemonSet, ConfigMap, Secret, Service.
+### Stack Builder
+
+Deploy multi-service stacks:
+
+```go
+stack := ilmari.NewStack().
+    Service("api").Image("myapp:v1").Port(8080).Replicas(2).
+    Service("db").Image("postgres:15").Port(5432).
+    Build()
+
+ctx.Up(stack) // Deploys all and waits for ready
+```
+
+### Fluent Deployment Builder
+
+```go
+deploy := ilmari.Deployment("myapp").
+    Image("nginx:alpine").
+    Replicas(3).
+    Port(80).
+    WithProbes().
+    Build()
+
+ctx.Apply(deploy)
+```
 
 ### Wait Operations
 
 ```go
-// Wait for ready (60s default)
-ctx.WaitReady("pod/myapp")
 ctx.WaitReady("deployment/myapp")
-
-// Custom timeout
 ctx.WaitReadyTimeout("pod/myapp", 2*time.Minute)
 
 // Custom condition
@@ -92,69 +111,59 @@ ctx.WaitFor("pod/myapp", func(obj interface{}) bool {
     pod := obj.(*corev1.Pod)
     return pod.Status.PodIP != ""
 })
+
+// Flakiness protection
+ctx.Eventually(func() bool {
+    return checkCondition()
+}).Within(30 * time.Second).Wait()
+
+ctx.Consistently(func() bool {
+    return staysTrue()
+}).For(10 * time.Second).Wait()
 ```
 
-### Port Forwarding
+### Port Forwarding & Exec
 
 ```go
 pf := ctx.Forward("svc/myapp", 8080)
 defer pf.Close()
+resp, _ := pf.Get("/health")
 
-resp, err := pf.Get("/health")
-defer resp.Body.Close()
+output, _ := ctx.Exec("my-pod", []string{"cat", "/etc/config"})
+logs, _ := ctx.Logs("my-pod")
 ```
 
-### Diagnostics
+### Assertions
 
 ```go
-logs, _ := ctx.Logs("my-pod")
-events, _ := ctx.Events()
-output, _ := ctx.Exec("my-pod", []string{"cat", "/etc/config"})
+err := ctx.Assert("deployment/myapp").
+    HasReplicas(3).
+    IsProgressing().
+    Error()
+
+ctx.Assert("pod/myapp").HasNoRestarts().NoOOMKills().Must()
 ```
 
-### Failure Output
+### Chaos Testing
 
-On test failure, ilmari dumps diagnostics with kubectl hints:
-
+```go
+ctx.Kill("pod/myapp-xyz")
+ctx.Isolate(map[string]string{"app": "myapp"}) // Network isolation
 ```
---- Ilmari Diagnostics ---
-Namespace: ilmari-test-a1b2c3d4 (kept for debugging)
 
---- Pods ---
-  myapp-xyz: ImagePullBackOff
-  --- Logs (myapp-xyz) ---
-    Error: connection refused
+## Namespace Policies
 
---- Events ---
-  myapp-xyz Pulling: Pulling image "myapp:test"
-  myapp-xyz Failed: Failed to pull image
-
---- kubectl commands ---
-  kubectl get pods -n ilmari-test-a1b2c3d4
-  kubectl describe pods -n ilmari-test-a1b2c3d4
-  kubectl logs -n ilmari-test-a1b2c3d4 <pod-name>
-
---- End Diagnostics ---
-```
+| Mode | Creation | Cleanup | Use Case |
+|------|----------|---------|----------|
+| `NewContext()` | Creates `ilmari-xxxxx` | Deleted on `Close()` | Default, isolated |
+| `WithNamespace("prod")` | Uses existing | Never deleted | Production, shared |
+| `WithIsolatedNamespace("test")` | Creates `test-xxxxx` | Deleted on `Close()` | Custom prefix |
 
 ## Requirements
 
 - Go 1.21+
 - Kubernetes cluster (kind, minikube, or real cluster)
 - Valid kubeconfig (`~/.kube/config`)
-
-## Running Tests
-
-```bash
-# Run all tests
-go test -v
-
-# Skip integration tests
-go test -short
-
-# Keep all namespaces for debugging
-ILMARI_KEEP_ALL=true go test -v
-```
 
 ## Family
 
@@ -164,6 +173,7 @@ ILMARI_KEEP_ALL=true go test -v
 | Go | **ilmari** | client-go |
 
 Seppo and Ilmari are both smith gods in Finnish mythology (Kalevala).
+Same concepts, native implementations.
 
 ## License
 

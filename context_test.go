@@ -2,6 +2,8 @@ package ilmari
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -607,4 +609,1171 @@ func TestStackDeploysServices(t *testing.T) {
 			t.Errorf("expected 200, got %d", resp.StatusCode)
 		}
 	})
+}
+
+// TestStackWithResources verifies Resources sets resource limits.
+func TestStackWithResources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		stack := NewStack().
+			Service("limited").Image("busybox:1.36").Command("sleep", "300").
+			Resources("100m", "64Mi").
+			Build()
+
+		if err := ctx.Up(stack); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		deploy := &appsv1.Deployment{}
+		if err := ctx.Get("limited", deploy); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		container := deploy.Spec.Template.Spec.Containers[0]
+		cpuLimit := container.Resources.Limits.Cpu()
+		memLimit := container.Resources.Limits.Memory()
+
+		if cpuLimit.String() != "100m" {
+			t.Errorf("expected cpu limit 100m, got %s", cpuLimit.String())
+		}
+		if memLimit.String() != "64Mi" {
+			t.Errorf("expected memory limit 64Mi, got %s", memLimit.String())
+		}
+	})
+}
+
+// TestRetrySucceedsOnTransientFailure verifies Retry with exponential backoff.
+func TestRetrySucceedsOnTransientFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		attempts := 0
+		err := ctx.Retry(3, func() error {
+			attempts++
+			if attempts < 3 {
+				return context.DeadlineExceeded // transient error
+			}
+			return nil
+		})
+
+		if err != nil {
+			t.Fatalf("Retry failed: %v", err)
+		}
+		if attempts != 3 {
+			t.Errorf("expected 3 attempts, got %d", attempts)
+		}
+	})
+}
+
+// TestRetryFailsAfterMaxAttempts verifies Retry returns error after max attempts.
+func TestRetryFailsAfterMaxAttempts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		attempts := 0
+		err := ctx.Retry(3, func() error {
+			attempts++
+			return context.DeadlineExceeded
+		})
+
+		if err == nil {
+			t.Fatal("expected error after max attempts")
+		}
+		if attempts != 3 {
+			t.Errorf("expected 3 attempts, got %d", attempts)
+		}
+	})
+}
+
+// TestKillDeletesPod verifies Kill deletes a pod immediately.
+func TestKillDeletesPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "kill-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/kill-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Kill the pod
+		if err := ctx.Kill("pod/kill-test"); err != nil {
+			t.Fatalf("Kill failed: %v", err)
+		}
+
+		// Pod should be gone or terminating
+		time.Sleep(500 * time.Millisecond)
+		got := &corev1.Pod{}
+		err := ctx.Get("kill-test", got)
+		if err == nil && got.DeletionTimestamp == nil {
+			t.Error("expected pod to be deleted or terminating")
+		}
+	})
+}
+
+// TestAssertHasLabel verifies Assert().HasLabel() works.
+func TestAssertHasLabel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "assert-test",
+				Labels: map[string]string{
+					"app": "test",
+				},
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Should pass
+		err := ctx.Assert("configmap/assert-test").HasLabel("app", "test").Error()
+		if err != nil {
+			t.Errorf("HasLabel should pass: %v", err)
+		}
+
+		// Should fail
+		err = ctx.Assert("configmap/assert-test").HasLabel("app", "wrong").Error()
+		if err == nil {
+			t.Error("HasLabel should fail for wrong value")
+		}
+	})
+}
+
+// TestAssertExists verifies Assert().Exists() works.
+func TestAssertExists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "exists-test",
+			},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Should pass
+		err := ctx.Assert("configmap/exists-test").Exists().Error()
+		if err != nil {
+			t.Errorf("Exists should pass: %v", err)
+		}
+
+		// Should fail for non-existent
+		err = ctx.Assert("configmap/nonexistent").Exists().Error()
+		if err == nil {
+			t.Error("Exists should fail for non-existent resource")
+		}
+	})
+}
+
+// TestAssertMustPanics verifies Assert().Must() panics on failure.
+func TestAssertMustPanics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("Must() should have panicked")
+			}
+		}()
+
+		ctx.Assert("configmap/nonexistent").Exists().Must()
+	})
+}
+
+// TestIsolateCreatesNetworkPolicy verifies Isolate creates deny-all policy.
+func TestIsolateCreatesNetworkPolicy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		err := ctx.Isolate(map[string]string{"app": "isolated"})
+		if err != nil {
+			t.Fatalf("Isolate failed: %v", err)
+		}
+
+		// Verify NetworkPolicy was created
+		policies, err := ctx.Client.NetworkingV1().NetworkPolicies(ctx.Namespace).List(
+			context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("List NetworkPolicies failed: %v", err)
+		}
+
+		found := false
+		for _, p := range policies.Items {
+			if strings.HasPrefix(p.Name, "ilmari-isolate") {
+				found = true
+				// Verify it's a deny-all policy
+				if len(p.Spec.Ingress) != 0 || len(p.Spec.Egress) != 0 {
+					t.Error("expected empty ingress/egress for deny-all")
+				}
+			}
+		}
+		if !found {
+			t.Error("NetworkPolicy not found")
+		}
+	})
+}
+
+// TestAllowFromCreatesNetworkPolicy verifies AllowFrom creates allow policy.
+func TestAllowFromCreatesNetworkPolicy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		err := ctx.AllowFrom(
+			map[string]string{"app": "backend"},
+			map[string]string{"app": "frontend"},
+		)
+		if err != nil {
+			t.Fatalf("AllowFrom failed: %v", err)
+		}
+
+		// Verify NetworkPolicy was created
+		policies, err := ctx.Client.NetworkingV1().NetworkPolicies(ctx.Namespace).List(
+			context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("List NetworkPolicies failed: %v", err)
+		}
+
+		found := false
+		for _, p := range policies.Items {
+			if strings.HasPrefix(p.Name, "ilmari-allow") {
+				found = true
+				if len(p.Spec.Ingress) != 1 {
+					t.Error("expected one ingress rule")
+				}
+			}
+		}
+		if !found {
+			t.Error("NetworkPolicy not found")
+		}
+	})
+}
+
+// TestLoadYAML verifies LoadYAML loads a single YAML file.
+func TestLoadYAML(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create temp YAML file
+		yamlContent := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yaml-test
+data:
+  key: value
+`
+		tmpDir := t.TempDir()
+		yamlPath := filepath.Join(tmpDir, "test.yaml")
+		if err := os.WriteFile(yamlPath, []byte(yamlContent), 0644); err != nil {
+			t.Fatalf("Failed to write yaml file: %v", err)
+		}
+
+		// Load it
+		if err := ctx.LoadYAML(yamlPath); err != nil {
+			t.Fatalf("LoadYAML failed: %v", err)
+		}
+
+		// Verify ConfigMap was created
+		cm := &corev1.ConfigMap{}
+		if err := ctx.Get("yaml-test", cm); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if cm.Data["key"] != "value" {
+			t.Errorf("expected key=value, got key=%s", cm.Data["key"])
+		}
+	})
+}
+
+// TestLoadYAMLMultiDoc verifies LoadYAML handles multi-document YAML.
+func TestLoadYAMLMultiDoc(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		yamlContent := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multi-1
+data:
+  n: "1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: multi-2
+data:
+  n: "2"
+`
+		tmpDir := t.TempDir()
+		yamlPath := filepath.Join(tmpDir, "multi.yaml")
+		if err := os.WriteFile(yamlPath, []byte(yamlContent), 0644); err != nil {
+			t.Fatalf("Failed to write yaml file: %v", err)
+		}
+
+		if err := ctx.LoadYAML(yamlPath); err != nil {
+			t.Fatalf("LoadYAML failed: %v", err)
+		}
+
+		// Both should exist
+		cm1 := &corev1.ConfigMap{}
+		if err := ctx.Get("multi-1", cm1); err != nil {
+			t.Fatalf("Get multi-1 failed: %v", err)
+		}
+		cm2 := &corev1.ConfigMap{}
+		if err := ctx.Get("multi-2", cm2); err != nil {
+			t.Fatalf("Get multi-2 failed: %v", err)
+		}
+	})
+}
+
+// TestLoadYAMLDir verifies LoadYAMLDir loads all YAML files from directory.
+func TestLoadYAMLDir(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		tmpDir := t.TempDir()
+
+		// Create two yaml files
+		yaml1 := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dir-test-1
+`
+		yaml2 := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dir-test-2
+`
+		if err := os.WriteFile(filepath.Join(tmpDir, "a.yaml"), []byte(yaml1), 0644); err != nil {
+			t.Fatalf("Failed to write a.yaml: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "b.yml"), []byte(yaml2), 0644); err != nil {
+			t.Fatalf("Failed to write b.yml: %v", err)
+		}
+		// Also create a non-yaml file that should be ignored
+		if err := os.WriteFile(filepath.Join(tmpDir, "ignore.txt"), []byte("ignored"), 0644); err != nil {
+			t.Fatalf("Failed to write ignore.txt: %v", err)
+		}
+
+		if err := ctx.LoadYAMLDir(tmpDir); err != nil {
+			t.Fatalf("LoadYAMLDir failed: %v", err)
+		}
+
+		// Both ConfigMaps should exist
+		cm1 := &corev1.ConfigMap{}
+		if err := ctx.Get("dir-test-1", cm1); err != nil {
+			t.Fatalf("Get dir-test-1 failed: %v", err)
+		}
+		cm2 := &corev1.ConfigMap{}
+		if err := ctx.Get("dir-test-2", cm2); err != nil {
+			t.Fatalf("Get dir-test-2 failed: %v", err)
+		}
+	})
+}
+
+// TestLoadYAMLWindowsLineEndings verifies YAML with CRLF line endings works.
+func TestLoadYAMLWindowsLineEndings(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// YAML with Windows line endings (CRLF)
+		yamlContent := "apiVersion: v1\r\nkind: ConfigMap\r\nmetadata:\r\n  name: crlf-test\r\ndata:\r\n  key: value\r\n"
+
+		tmpDir := t.TempDir()
+		yamlPath := filepath.Join(tmpDir, "crlf.yaml")
+		if err := os.WriteFile(yamlPath, []byte(yamlContent), 0644); err != nil {
+			t.Fatalf("Failed to write yaml file: %v", err)
+		}
+
+		if err := ctx.LoadYAML(yamlPath); err != nil {
+			t.Fatalf("LoadYAML with CRLF failed: %v", err)
+		}
+
+		cm := &corev1.ConfigMap{}
+		if err := ctx.Get("crlf-test", cm); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+	})
+}
+
+// ============================================================================
+// Semantic Assertions Tests
+// ============================================================================
+
+// TestAssertHasReplicas verifies HasReplicas checks ready replicas.
+func TestAssertHasReplicas(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		stack := NewStack().
+			Service("replicas-test").Image("nginx:alpine").Port(80).Replicas(2).
+			Build()
+
+		if err := ctx.Up(stack); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		// Should pass - 2 replicas ready
+		err := ctx.Assert("deployment/replicas-test").HasReplicas(2).Error()
+		if err != nil {
+			t.Errorf("HasReplicas(2) should pass: %v", err)
+		}
+
+		// Should fail - not 5 replicas
+		err = ctx.Assert("deployment/replicas-test").HasReplicas(5).Error()
+		if err == nil {
+			t.Error("HasReplicas(5) should fail")
+		}
+	})
+}
+
+// TestAssertIsProgressing verifies IsProgressing for deployments.
+func TestAssertIsProgressing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		stack := NewStack().
+			Service("progress-test").Image("nginx:alpine").Port(80).
+			Build()
+
+		if err := ctx.Up(stack); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		// Stable deployment should be progressing (or complete)
+		err := ctx.Assert("deployment/progress-test").IsProgressing().Error()
+		if err != nil {
+			t.Errorf("IsProgressing should pass for healthy deployment: %v", err)
+		}
+	})
+}
+
+// TestAssertHasNoRestarts verifies HasNoRestarts checks container restarts.
+func TestAssertHasNoRestarts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "no-restart-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/no-restart-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Fresh pod should have no restarts
+		err := ctx.Assert("pod/no-restart-test").HasNoRestarts().Error()
+		if err != nil {
+			t.Errorf("HasNoRestarts should pass: %v", err)
+		}
+	})
+}
+
+// TestAssertLogsContain verifies LogsContain checks pod logs.
+func TestAssertLogsContain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "logs-test",
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "echo 'ilmari-marker-12345' && sleep 60"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/logs-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait a moment for logs
+		time.Sleep(2 * time.Second)
+
+		// Should find the marker
+		err := ctx.Assert("pod/logs-test").LogsContain("ilmari-marker-12345").Error()
+		if err != nil {
+			t.Errorf("LogsContain should pass: %v", err)
+		}
+
+		// Should not find random string
+		err = ctx.Assert("pod/logs-test").LogsContain("nonexistent-xyz-987").Error()
+		if err == nil {
+			t.Error("LogsContain should fail for missing text")
+		}
+	})
+}
+
+// TestAssertNoOOMKills verifies NoOOMKills checks for OOM terminations.
+func TestAssertNoOOMKills(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "oom-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/oom-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Normal pod should have no OOM kills
+		err := ctx.Assert("pod/oom-test").NoOOMKills().Error()
+		if err != nil {
+			t.Errorf("NoOOMKills should pass: %v", err)
+		}
+	})
+}
+
+// ============================================================================
+// Fluent Deployment Builder Tests
+// ============================================================================
+
+// TestDeploymentBuilder verifies fluent Deployment builder.
+func TestDeploymentBuilder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("fluent-test").
+			Image("nginx:alpine").
+			Replicas(2).
+			Port(80).
+			Env("FOO", "bar").
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/fluent-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		got := &appsv1.Deployment{}
+		if err := ctx.Get("fluent-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if *got.Spec.Replicas != 2 {
+			t.Errorf("expected 2 replicas, got %d", *got.Spec.Replicas)
+		}
+
+		container := got.Spec.Template.Spec.Containers[0]
+		if container.Image != "nginx:alpine" {
+			t.Errorf("expected image nginx:alpine, got %s", container.Image)
+		}
+	})
+}
+
+// TestDeploymentBuilderWithProbes verifies WithProbes adds sensible defaults.
+func TestDeploymentBuilderWithProbes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("probes-test").
+			Image("nginx:alpine").
+			Port(80).
+			WithProbes().
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		got := &appsv1.Deployment{}
+		if err := ctx.Get("probes-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		container := got.Spec.Template.Spec.Containers[0]
+		if container.LivenessProbe == nil {
+			t.Error("expected liveness probe")
+		}
+		if container.ReadinessProbe == nil {
+			t.Error("expected readiness probe")
+		}
+	})
+}
+
+// TestLoadFixture verifies LoadFixture loads YAML with overrides.
+func TestLoadFixture(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create fixture file
+		yamlContent := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fixture-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fixture-test
+  template:
+    metadata:
+      labels:
+        app: fixture-test
+    spec:
+      containers:
+      - name: main
+        image: nginx:1.20
+        ports:
+        - containerPort: 80
+`
+		tmpDir := t.TempDir()
+		fixturePath := filepath.Join(tmpDir, "deployment.yaml")
+		if err := os.WriteFile(fixturePath, []byte(yamlContent), 0644); err != nil {
+			t.Fatalf("Failed to write fixture: %v", err)
+		}
+
+		// Load with overrides
+		deploy := ctx.LoadFixture(fixturePath).
+			WithImage("nginx:alpine").
+			WithReplicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/fixture-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		got := &appsv1.Deployment{}
+		if err := ctx.Get("fixture-test", got); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		// Should have overridden values
+		if *got.Spec.Replicas != 1 {
+			t.Errorf("expected 1 replica (overridden), got %d", *got.Spec.Replicas)
+		}
+		if got.Spec.Template.Spec.Containers[0].Image != "nginx:alpine" {
+			t.Errorf("expected image nginx:alpine (overridden), got %s", got.Spec.Template.Spec.Containers[0].Image)
+		}
+	})
+}
+
+// ============================================================================
+// Eventually/Consistently Tests
+// ============================================================================
+
+// TestEventuallySucceeds verifies Eventually waits for condition.
+func TestEventuallySucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "eventually-test",
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:    "sleep",
+						Image:   "busybox:1.36",
+						Command: []string{"sleep", "300"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Eventually the pod should be running
+		err := ctx.Eventually(func() bool {
+			p := &corev1.Pod{}
+			if err := ctx.Get("eventually-test", p); err != nil {
+				return false
+			}
+			return p.Status.Phase == corev1.PodRunning
+		}).Within(60 * time.Second).ProbeEvery(1 * time.Second).Wait()
+
+		if err != nil {
+			t.Fatalf("Eventually failed: %v", err)
+		}
+	})
+}
+
+// TestEventuallyTimesOut verifies Eventually returns error on timeout.
+func TestEventuallyTimesOut(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// This will never be true
+		err := ctx.Eventually(func() bool {
+			return false
+		}).Within(2 * time.Second).ProbeEvery(100 * time.Millisecond).Wait()
+
+		if err == nil {
+			t.Error("expected timeout error")
+		}
+	})
+}
+
+// TestConsistentlySucceeds verifies Consistently passes when condition stays true.
+func TestConsistentlySucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "consistent-test",
+			},
+			Data: map[string]string{"key": "value"},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// ConfigMap should stay present
+		err := ctx.Consistently(func() bool {
+			c := &corev1.ConfigMap{}
+			return ctx.Get("consistent-test", c) == nil
+		}).For(2 * time.Second).ProbeEvery(200 * time.Millisecond).Wait()
+
+		if err != nil {
+			t.Errorf("Consistently failed: %v", err)
+		}
+	})
+}
+
+// TestConsistentlyFails verifies Consistently fails if condition becomes false.
+func TestConsistentlyFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		counter := 0
+		// Will become false after a few checks
+		err := ctx.Consistently(func() bool {
+			counter++
+			return counter < 5
+		}).For(5 * time.Second).ProbeEvery(100 * time.Millisecond).Wait()
+
+		if err == nil {
+			t.Error("expected failure when condition becomes false")
+		}
+	})
+}
+
+// ============================================================================
+// Better Failure Output Tests
+// ============================================================================
+
+// TestWaitErrorHasDiagnostics verifies WaitError includes diagnostic info.
+func TestWaitErrorHasDiagnostics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a deployment that will never be ready (bad image)
+		deploy := Deployment("bad-image-test").
+			Image("nonexistent-image-xyz-12345:latest").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Wait should timeout with rich error
+		err := ctx.WaitReadyTimeout("deployment/bad-image-test", 10*time.Second)
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+
+		// Error should contain diagnostic info
+		errStr := err.Error()
+		if !strings.Contains(errStr, "bad-image-test") {
+			t.Error("error should mention resource name")
+		}
+
+		// Check if it's a WaitError with diagnostics
+		if waitErr, ok := err.(*WaitError); ok {
+			if waitErr.Resource == "" {
+				t.Error("WaitError should have Resource set")
+			}
+			if len(waitErr.Pods) == 0 && len(waitErr.Events) == 0 {
+				t.Log("Note: WaitError has no pods/events (may be expected)")
+			}
+		}
+	})
+}
+
+// ============================================================================
+// Test Scenarios Tests
+// ============================================================================
+
+// TestSelfHealingScenario verifies TestSelfHealing works.
+func TestSelfHealingScenario(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("heal-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Port(80).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("deployment/heal-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Run self-healing test
+		err := ctx.TestSelfHealing("deployment/heal-test", func(s *SelfHealTest) {
+			s.KillPod()
+			s.ExpectRecoveryWithin(60 * time.Second)
+		})
+		if err != nil {
+			t.Fatalf("TestSelfHealing failed: %v", err)
+		}
+	})
+}
+
+// TestScalingScenario verifies TestScaling works.
+func TestScalingScenario(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("scale-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Port(80).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("deployment/scale-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Run scaling test
+		err := ctx.TestScaling("deployment/scale-test", func(s *ScaleTest) {
+			s.ScaleTo(2)
+			s.WaitStable()
+			s.ScaleTo(1)
+			s.WaitStable()
+		})
+		if err != nil {
+			t.Fatalf("TestScaling failed: %v", err)
+		}
+	})
+}
+
+// ============================================================================
+// Traffic Testing Tests
+// ============================================================================
+
+// TestTrafficGenerator verifies StartTraffic generates load and collects metrics.
+func TestTrafficGenerator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Deploy nginx
+		deploy := Deployment("traffic-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Port(80).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "traffic-test",
+			},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "traffic-test"},
+				Ports:    []corev1.ServicePort{{Port: 80}},
+			},
+		}
+		if err := ctx.Apply(svc); err != nil {
+			t.Fatalf("Apply svc failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/traffic-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Start traffic
+		traffic := ctx.StartTraffic("svc/traffic-test", func(t *TrafficConfig) {
+			t.RPS(10)
+			t.Duration(5 * time.Second)
+			t.Endpoint("/")
+		})
+
+		// Wait for traffic to complete
+		traffic.Wait()
+
+		// Check metrics
+		if traffic.TotalRequests() == 0 {
+			t.Error("expected some requests")
+		}
+		if traffic.ErrorRate() > 0.1 {
+			t.Errorf("error rate too high: %.2f", traffic.ErrorRate())
+		}
+
+		t.Logf("Traffic stats: %d requests, %.2f%% errors, p99=%v",
+			traffic.TotalRequests(),
+			traffic.ErrorRate()*100,
+			traffic.P99Latency())
+	})
+}
+
+// ============================================================================
+// Phase 0: SDK Primitives - NewContext without test wrapper
+// ============================================================================
+
+// TestNewContextWithoutTestWrapper verifies NewContext works standalone.
+func TestNewContextWithoutTestWrapper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	// Create context without Run() wrapper
+	ctx, err := NewContext()
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	defer ctx.Close()
+
+	// Should have a client
+	if ctx.Client == nil {
+		t.Error("Client should not be nil")
+	}
+
+	// Should have created a namespace
+	if ctx.Namespace == "" {
+		t.Error("Namespace should not be empty")
+	}
+
+	// Namespace should exist in cluster
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), ctx.Namespace, metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Namespace should exist: %v", err)
+	}
+}
+
+// TestNewContextWithSharedNamespace verifies using an existing namespace.
+func TestNewContextWithSharedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	// Use default namespace (always exists)
+	ctx, err := NewContext(WithNamespace("default"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	defer ctx.Close()
+
+	// Should use the specified namespace
+	if ctx.Namespace != "default" {
+		t.Errorf("expected namespace 'default', got %s", ctx.Namespace)
+	}
+
+	// Should be able to list pods (proves connection works)
+	_, err = ctx.Client.CoreV1().Pods(ctx.Namespace).List(
+		context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Errorf("Failed to list pods: %v", err)
+	}
+}
+
+// TestNewContextWithIsolatedNamespace verifies isolated namespace creation.
+func TestNewContextWithIsolatedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx, err := NewContext(WithIsolatedNamespace("mytest"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	defer ctx.Close()
+
+	// Should have prefix + random suffix
+	if !strings.HasPrefix(ctx.Namespace, "mytest-") {
+		t.Errorf("expected namespace to start with 'mytest-', got %s", ctx.Namespace)
+	}
+
+	// Should be longer than just prefix
+	if len(ctx.Namespace) <= 7 {
+		t.Errorf("namespace should have random suffix: %s", ctx.Namespace)
+	}
+}
+
+// TestContextCloseDeletesIsolatedNamespace verifies cleanup.
+func TestContextCloseDeletesIsolatedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx, err := NewContext(WithIsolatedNamespace("cleanup-test"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+
+	ns := ctx.Namespace
+
+	// Close should delete the namespace
+	ctx.Close()
+
+	// Give K8s a moment to delete
+	time.Sleep(500 * time.Millisecond)
+
+	// Namespace should be gone (or terminating)
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), ns, metav1.GetOptions{})
+	if err == nil {
+		// Check if it's terminating
+		nsObj, _ := ctx.Client.CoreV1().Namespaces().Get(
+			context.Background(), ns, metav1.GetOptions{})
+		if nsObj.Status.Phase != corev1.NamespaceTerminating {
+			t.Errorf("Namespace should be deleted or terminating, got phase: %s", nsObj.Status.Phase)
+		}
+	}
+}
+
+// TestContextCloseKeepsSharedNamespace verifies shared namespaces aren't deleted.
+func TestContextCloseKeepsSharedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx, err := NewContext(WithNamespace("default"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+
+	// Close should NOT delete default namespace
+	ctx.Close()
+
+	// default should still exist
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), "default", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("default namespace should still exist: %v", err)
+	}
 }
