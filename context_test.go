@@ -1639,3 +1639,141 @@ func TestTrafficGenerator(t *testing.T) {
 			traffic.P99Latency())
 	})
 }
+
+// ============================================================================
+// Phase 0: SDK Primitives - NewContext without test wrapper
+// ============================================================================
+
+// TestNewContextWithoutTestWrapper verifies NewContext works standalone.
+func TestNewContextWithoutTestWrapper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	// Create context without Run() wrapper
+	ctx, err := NewContext()
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	defer ctx.Close()
+
+	// Should have a client
+	if ctx.Client == nil {
+		t.Error("Client should not be nil")
+	}
+
+	// Should have created a namespace
+	if ctx.Namespace == "" {
+		t.Error("Namespace should not be empty")
+	}
+
+	// Namespace should exist in cluster
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), ctx.Namespace, metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("Namespace should exist: %v", err)
+	}
+}
+
+// TestNewContextWithSharedNamespace verifies using an existing namespace.
+func TestNewContextWithSharedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	// Use default namespace (always exists)
+	ctx, err := NewContext(WithNamespace("default"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	defer ctx.Close()
+
+	// Should use the specified namespace
+	if ctx.Namespace != "default" {
+		t.Errorf("expected namespace 'default', got %s", ctx.Namespace)
+	}
+
+	// Should be able to list pods (proves connection works)
+	_, err = ctx.Client.CoreV1().Pods(ctx.Namespace).List(
+		context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Errorf("Failed to list pods: %v", err)
+	}
+}
+
+// TestNewContextWithIsolatedNamespace verifies isolated namespace creation.
+func TestNewContextWithIsolatedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx, err := NewContext(WithIsolatedNamespace("mytest"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	defer ctx.Close()
+
+	// Should have prefix + random suffix
+	if !strings.HasPrefix(ctx.Namespace, "mytest-") {
+		t.Errorf("expected namespace to start with 'mytest-', got %s", ctx.Namespace)
+	}
+
+	// Should be longer than just prefix
+	if len(ctx.Namespace) <= 7 {
+		t.Errorf("namespace should have random suffix: %s", ctx.Namespace)
+	}
+}
+
+// TestContextCloseDeletesIsolatedNamespace verifies cleanup.
+func TestContextCloseDeletesIsolatedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx, err := NewContext(WithIsolatedNamespace("cleanup-test"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+
+	ns := ctx.Namespace
+
+	// Close should delete the namespace
+	ctx.Close()
+
+	// Give K8s a moment to delete
+	time.Sleep(500 * time.Millisecond)
+
+	// Namespace should be gone (or terminating)
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), ns, metav1.GetOptions{})
+	if err == nil {
+		// Check if it's terminating
+		nsObj, _ := ctx.Client.CoreV1().Namespaces().Get(
+			context.Background(), ns, metav1.GetOptions{})
+		if nsObj.Status.Phase != corev1.NamespaceTerminating {
+			t.Errorf("Namespace should be deleted or terminating, got phase: %s", nsObj.Status.Phase)
+		}
+	}
+}
+
+// TestContextCloseKeepsSharedNamespace verifies shared namespaces aren't deleted.
+func TestContextCloseKeepsSharedNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx, err := NewContext(WithNamespace("default"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+
+	// Close should NOT delete default namespace
+	ctx.Close()
+
+	// default should still exist
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), "default", metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("default namespace should still exist: %v", err)
+	}
+}

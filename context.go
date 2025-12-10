@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
@@ -55,7 +56,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Context provides a Kubernetes connection with an isolated namespace for testing.
+// Context provides a Kubernetes connection for SDK operations.
 type Context struct {
 	// Client is the Kubernetes clientset
 	Client *kubernetes.Clientset
@@ -63,10 +64,10 @@ type Context struct {
 	// Dynamic is the dynamic client for CRDs and unstructured resources
 	Dynamic dynamic.Interface
 
-	// Namespace is the isolated test namespace
+	// Namespace is the working namespace
 	Namespace string
 
-	// t is the test instance for logging
+	// t is the test instance for logging (optional, nil for standalone usage)
 	t *testing.T
 
 	// tracer for OpenTelemetry tracing (optional)
@@ -74,6 +75,12 @@ type Context struct {
 
 	// mapper for GVK to GVR discovery
 	mapper *restmapper.DeferredDiscoveryRESTMapper
+
+	// ownsNamespace tracks whether Close() should delete the namespace
+	ownsNamespace bool
+
+	// restConfig is stored for operations that need it
+	restConfig *rest.Config
 }
 
 // Config configures the test context behavior.
@@ -97,6 +104,159 @@ func DefaultConfig() Config {
 	return Config{
 		KeepOnFailure: true,
 		KeepAlways:    os.Getenv("ILMARI_KEEP_ALL") == "true",
+	}
+}
+
+// ============================================================================
+// Standalone SDK Usage (no test wrapper required)
+// ============================================================================
+
+// ContextOption configures a Context.
+type ContextOption func(*contextOptions)
+
+// contextOptions holds configuration for NewContext.
+type contextOptions struct {
+	kubeconfig        string
+	namespace         string // use existing namespace (shared)
+	isolatedPrefix    string // create isolated namespace with prefix
+	tracerProvider    trace.TracerProvider
+}
+
+// WithKubeconfig sets a custom kubeconfig path.
+func WithKubeconfig(path string) ContextOption {
+	return func(o *contextOptions) {
+		o.kubeconfig = path
+	}
+}
+
+// WithNamespace uses an existing namespace (shared mode).
+// The namespace will NOT be deleted on Close().
+func WithNamespace(ns string) ContextOption {
+	return func(o *contextOptions) {
+		o.namespace = ns
+		o.isolatedPrefix = "" // clear isolated if set
+	}
+}
+
+// WithIsolatedNamespace creates a new namespace with the given prefix.
+// A random suffix is appended. The namespace IS deleted on Close().
+func WithIsolatedNamespace(prefix string) ContextOption {
+	return func(o *contextOptions) {
+		o.isolatedPrefix = prefix
+		o.namespace = "" // clear shared if set
+	}
+}
+
+// WithTracerProvider sets a custom OpenTelemetry tracer provider.
+func WithTracerProvider(tp trace.TracerProvider) ContextOption {
+	return func(o *contextOptions) {
+		o.tracerProvider = tp
+	}
+}
+
+// NewContext creates a new Context for standalone SDK usage.
+// By default, creates an isolated namespace that is deleted on Close().
+//
+// Examples:
+//
+//	ctx, _ := ilmari.NewContext()                              // isolated, auto-cleanup
+//	ctx, _ := ilmari.NewContext(ilmari.WithNamespace("prod"))  // shared, no cleanup
+//	ctx, _ := ilmari.NewContext(ilmari.WithIsolatedNamespace("mytest")) // isolated with prefix
+func NewContext(opts ...ContextOption) (*Context, error) {
+	options := &contextOptions{
+		isolatedPrefix: "ilmari", // default: create isolated namespace
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	// Load kubeconfig
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if options.kubeconfig != "" {
+		loadingRules.ExplicitPath = options.kubeconfig
+	}
+
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	// Create clientset
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	// Create dynamic client for CRDs
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Create discovery client and REST mapper
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(
+		&cachedDiscovery{DiscoveryInterface: discoveryClient},
+	)
+
+	// Initialize tracer
+	var tracer trace.Tracer
+	if options.tracerProvider != nil {
+		tracer = options.tracerProvider.Tracer("ilmari")
+	} else {
+		tracer = otel.Tracer("ilmari")
+	}
+
+	ctx := &Context{
+		Client:     client,
+		Dynamic:    dynamicClient,
+		tracer:     tracer,
+		mapper:     mapper,
+		restConfig: config,
+	}
+
+	// Handle namespace: shared vs isolated
+	if options.namespace != "" {
+		// Shared mode: use existing namespace, don't delete on close
+		ctx.Namespace = options.namespace
+		ctx.ownsNamespace = false
+	} else {
+		// Isolated mode: create new namespace with random suffix
+		id := uuid.New().String()[:8]
+		ctx.Namespace = fmt.Sprintf("%s-%s", options.isolatedPrefix, id)
+		ctx.ownsNamespace = true
+
+		// Create namespace
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: ctx.Namespace,
+				Labels: map[string]string{
+					"ilmari.io/managed": "true",
+				},
+			},
+		}
+
+		_, err = client.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create namespace: %w", err)
+		}
+	}
+
+	return ctx, nil
+}
+
+// Close cleans up the Context.
+// For isolated namespaces, this deletes the namespace.
+// For shared namespaces, this is a no-op.
+func (c *Context) Close() {
+	if c.ownsNamespace {
+		_ = c.cleanup()
 	}
 }
 
@@ -198,12 +358,14 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 	}
 
 	return &Context{
-		Client:    client,
-		Dynamic:   dynamicClient,
-		Namespace: namespace,
-		t:         t,
-		tracer:    tracer,
-		mapper:    mapper,
+		Client:        client,
+		Dynamic:       dynamicClient,
+		Namespace:     namespace,
+		t:             t,
+		tracer:        tracer,
+		mapper:        mapper,
+		ownsNamespace: true,
+		restConfig:    config,
 	}, nil
 }
 
@@ -675,6 +837,9 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 
 	bgCtx := context.Background()
 
+	// Build label selector for filtering pods
+	var labelSelector string
+
 	// Get deployment status if applicable
 	if kind == "deployment" {
 		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(bgCtx, name, metav1.GetOptions{})
@@ -685,11 +850,20 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 			}
 			waitErr.Expected = fmt.Sprintf("ReadyReplicas >= %d", desired)
 			waitErr.Actual = fmt.Sprintf("ReadyReplicas = %d", deploy.Status.ReadyReplicas)
+
+			// Extract label selector from deployment
+			if deploy.Spec.Selector != nil && deploy.Spec.Selector.MatchLabels != nil {
+				labelSelector = labels.SelectorFromSet(deploy.Spec.Selector.MatchLabels).String()
+			}
 		}
 	}
 
-	// Get pod statuses
-	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(bgCtx, metav1.ListOptions{})
+	// Get pod statuses (filtered by label selector if available)
+	listOpts := metav1.ListOptions{}
+	if labelSelector != "" {
+		listOpts.LabelSelector = labelSelector
+	}
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(bgCtx, listOpts)
 	if err == nil {
 		for _, pod := range pods.Items {
 			ps := PodStatus{
@@ -930,19 +1104,23 @@ type PortForward struct {
 	httpClient *http.Client
 	err        error
 	span       trace.Span
+	closeOnce  sync.Once
 }
 
 // Close closes the port forward and waits for cleanup.
+// Safe to call multiple times.
 func (pf *PortForward) Close() {
-	if pf.stopChan != nil {
-		close(pf.stopChan)
-	}
-	if pf.doneChan != nil {
-		<-pf.doneChan
-	}
-	if pf.span != nil {
-		pf.span.End()
-	}
+	pf.closeOnce.Do(func() {
+		if pf.stopChan != nil {
+			close(pf.stopChan)
+		}
+		if pf.doneChan != nil {
+			<-pf.doneChan
+		}
+		if pf.span != nil {
+			pf.span.End()
+		}
+	})
 }
 
 // Get makes an HTTP GET request through the port forward.
@@ -2266,16 +2444,18 @@ func (e *EventuallyBuilder) Wait() error {
 	}
 
 	for {
+		// Check deadline before waiting on ticker
+		if time.Now().After(deadline) {
+			err := fmt.Errorf("condition not met within %v", e.timeout)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+
 		select {
 		case <-ticker.C:
 			if e.fn() {
 				return nil
-			}
-			if time.Now().After(deadline) {
-				err := fmt.Errorf("condition not met within %v", e.timeout)
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return err
 			}
 		}
 	}
