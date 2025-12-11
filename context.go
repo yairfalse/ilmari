@@ -38,7 +38,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -992,6 +994,265 @@ func isStatefulSetReady(ss *appsv1.StatefulSet) bool {
 func isDaemonSetReady(ds *appsv1.DaemonSet) bool {
 	return ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
 		ds.Status.DesiredNumberScheduled > 0
+}
+
+// ============================================================================
+// Watch, WaitDeleted, Patch - Phase 1 Core Primitives
+// ============================================================================
+
+// WatchEvent represents a Kubernetes watch event.
+type WatchEvent struct {
+	Type   string      // ADDED, MODIFIED, DELETED
+	Object interface{} // The resource object
+}
+
+// Watch starts watching resources of the given kind.
+// Returns a stop function to cancel the watch.
+// The callback is invoked for each event (ADDED, MODIFIED, DELETED).
+func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
+	_, span := c.startSpan(context.Background(), "ilmari.Watch",
+		attribute.String("kind", kind))
+
+	stopChan := make(chan struct{})
+
+	go func() {
+		defer span.End()
+
+		ctx := context.Background()
+		kind = strings.ToLower(kind)
+
+		var watcher watch.Interface
+		var err error
+
+		switch kind {
+		case "pod":
+			watcher, err = c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		case "deployment":
+			watcher, err = c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		case "configmap":
+			watcher, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		case "secret":
+			watcher, err = c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		case "service":
+			watcher, err = c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		case "statefulset":
+			watcher, err = c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		case "daemonset":
+			watcher, err = c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		default:
+			span.RecordError(fmt.Errorf("unsupported kind: %s", kind))
+			return
+		}
+
+		if err != nil {
+			span.RecordError(err)
+			return
+		}
+		defer watcher.Stop()
+
+		for {
+			select {
+			case <-stopChan:
+				return
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					return
+				}
+				callback(WatchEvent{
+					Type:   string(event.Type),
+					Object: event.Object,
+				})
+			}
+		}
+	}()
+
+	return func() {
+		close(stopChan)
+	}
+}
+
+// WaitDeleted waits for a resource to be deleted.
+// Resource format: "kind/name" (e.g., "pod/myapp", "configmap/myconfig")
+func (c *Context) WaitDeleted(resource string) error {
+	return c.WaitDeletedTimeout(resource, 60*time.Second)
+}
+
+// WaitDeletedTimeout waits for a resource to be deleted with custom timeout.
+func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitDeleted",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		exists, checkErr := c.resourceExists(kind, name)
+		if checkErr != nil {
+			err = checkErr
+			return err
+		}
+		if !exists {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			err = fmt.Errorf("timeout waiting for %s to be deleted", resource)
+			return err
+		case <-ticker.C:
+		}
+	}
+}
+
+// resourceExists checks if a resource exists.
+func (c *Context) resourceExists(kind, name string) (bool, error) {
+	ctx := context.Background()
+
+	switch kind {
+	case "pod":
+		_, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	case "deployment":
+		_, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	case "configmap":
+		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	case "secret":
+		_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	case "service":
+		_, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	case "statefulset":
+		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	case "daemonset":
+		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return err == nil, err
+
+	default:
+		return false, fmt.Errorf("unsupported kind: %s", kind)
+	}
+}
+
+// PatchType specifies the type of patch operation.
+type PatchType string
+
+const (
+	// PatchStrategic uses strategic merge patch (default for K8s resources)
+	PatchStrategic PatchType = "strategic"
+	// PatchMerge uses JSON merge patch (RFC 7386)
+	PatchMerge PatchType = "merge"
+	// PatchJSON uses JSON patch (RFC 6902)
+	PatchJSON PatchType = "json"
+)
+
+// Patch applies a patch to a resource.
+// Resource format: "kind/name" (e.g., "deployment/myapp")
+func (c *Context) Patch(resource string, patch []byte, patchType PatchType) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Patch",
+		attribute.String("resource", resource),
+		attribute.String("patch_type", string(patchType)))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	// Convert PatchType to Kubernetes patch type
+	var k8sPatchType types.PatchType
+	switch patchType {
+	case PatchStrategic:
+		k8sPatchType = types.StrategicMergePatchType
+	case PatchMerge:
+		k8sPatchType = types.MergePatchType
+	case PatchJSON:
+		k8sPatchType = types.JSONPatchType
+	default:
+		k8sPatchType = types.StrategicMergePatchType
+	}
+
+	ctx := context.Background()
+
+	switch kind {
+	case "pod":
+		_, err = c.Client.CoreV1().Pods(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	case "deployment":
+		_, err = c.Client.AppsV1().Deployments(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	case "configmap":
+		_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	case "secret":
+		_, err = c.Client.CoreV1().Secrets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	case "service":
+		_, err = c.Client.CoreV1().Services(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	case "statefulset":
+		_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	case "daemonset":
+		_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+	default:
+		err = fmt.Errorf("unsupported kind: %s", kind)
+	}
+
+	return err
 }
 
 // Logs retrieves logs from a pod.

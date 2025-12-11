@@ -1324,10 +1324,13 @@ spec:
 		}
 
 		// Load with overrides
-		deploy := ctx.LoadFixture(fixturePath).
+		deploy, err := ctx.LoadFixture(fixturePath).
 			WithImage("nginx:alpine").
 			WithReplicas(1).
 			Build()
+		if err != nil {
+			t.Fatalf("Build failed: %v", err)
+		}
 
 		if err := ctx.Apply(deploy); err != nil {
 			t.Fatalf("Apply failed: %v", err)
@@ -1776,4 +1779,134 @@ func TestContextCloseKeepsSharedNamespace(t *testing.T) {
 	if err != nil {
 		t.Errorf("default namespace should still exist: %v", err)
 	}
+}
+
+// ============================================================================
+// Phase 1: Core Primitives
+// ============================================================================
+
+// TestWatchReceivesEvents verifies Watch streams resource events.
+func TestWatchReceivesEvents(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		events := make([]WatchEvent, 0)
+		done := make(chan struct{})
+
+		// Start watching ConfigMaps
+		stop := ctx.Watch("configmap", func(event WatchEvent) {
+			events = append(events, event)
+			if len(events) >= 2 {
+				close(done)
+			}
+		})
+		defer stop()
+
+		// Create a ConfigMap - should trigger ADDED event
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "watch-test"},
+			Data:       map[string]string{"key": "value1"},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Update it - should trigger MODIFIED event
+		cm.Data["key"] = "value2"
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply update failed: %v", err)
+		}
+
+		// Wait for events
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timeout waiting for watch events, got %d", len(events))
+		}
+
+		// Verify events
+		if len(events) < 2 {
+			t.Fatalf("expected at least 2 events, got %d", len(events))
+		}
+		if events[0].Type != "ADDED" {
+			t.Errorf("expected first event ADDED, got %s", events[0].Type)
+		}
+		if events[1].Type != "MODIFIED" {
+			t.Errorf("expected second event MODIFIED, got %s", events[1].Type)
+		}
+	})
+}
+
+// TestWaitDeletedWaitsForRemoval verifies WaitDeleted blocks until resource is gone.
+func TestWaitDeletedWaitsForRemoval(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "delete-test"},
+			Data:       map[string]string{"key": "value"},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Delete it in background
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			ctx.Delete("delete-test", &corev1.ConfigMap{})
+		}()
+
+		// WaitDeleted should block until it's gone
+		err := ctx.WaitDeleted("configmap/delete-test")
+		if err != nil {
+			t.Errorf("WaitDeleted failed: %v", err)
+		}
+
+		// Verify it's actually gone
+		err = ctx.Get("delete-test", &corev1.ConfigMap{})
+		if err == nil {
+			t.Error("ConfigMap should be deleted")
+		}
+	})
+}
+
+// TestPatchStrategicMerge verifies strategic merge patch.
+func TestPatchStrategicMerge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a deployment
+		deploy := Deployment("patch-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Patch to add a label
+		patch := []byte(`{"metadata":{"labels":{"patched":"true"}}}`)
+		err := ctx.Patch("deployment/patch-test", patch, PatchStrategic)
+		if err != nil {
+			t.Fatalf("Patch failed: %v", err)
+		}
+
+		// Verify label was added
+		var updated appsv1.Deployment
+		if err := ctx.Get("patch-test", &updated); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if updated.Labels["patched"] != "true" {
+			t.Errorf("expected label patched=true, got %v", updated.Labels)
+		}
+	})
 }
