@@ -1013,13 +1013,14 @@ type WatchEvent struct {
 }
 
 // Watch starts watching resources of the given kind.
-// Returns a stop function to cancel the watch.
+// Returns a stop function to cancel the watch. Safe to call multiple times.
 // The callback is invoked for each event (ADDED, MODIFIED, DELETED).
 func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 	_, span := c.startSpan(context.Background(), "ilmari.Watch",
 		attribute.String("kind", kind))
 
 	stopChan := make(chan struct{})
+	var stopOnce sync.Once
 
 	go func() {
 		defer span.End()
@@ -1073,7 +1074,9 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 	}()
 
 	return func() {
-		close(stopChan)
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
 	}
 }
 
@@ -1290,13 +1293,14 @@ func (c *Context) Logs(pod string) (result string, err error) {
 }
 
 // LogsStream streams logs from a pod in real-time.
-// Returns a stop function to cancel the stream.
+// Returns a stop function to cancel the stream. Safe to call multiple times.
 // Each line is passed to the callback as it arrives.
 func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 	_, span := c.startSpan(context.Background(), "ilmari.LogsStream",
 		attribute.String("pod", pod))
 
 	stopChan := make(chan struct{})
+	var stopOnce sync.Once
 
 	go func() {
 		defer span.End()
@@ -1331,7 +1335,9 @@ func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 	}()
 
 	return func() {
-		close(stopChan)
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
 	}
 }
 
