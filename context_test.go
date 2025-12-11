@@ -1910,3 +1910,149 @@ func TestPatchStrategicMerge(t *testing.T) {
 		}
 	})
 }
+
+// TestLogsStreamReceivesLogs verifies LogsStream streams logs in real-time.
+func TestLogsStreamReceivesLogs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod that outputs logs
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "logs-stream-test"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "logger",
+					Image:   "busybox",
+					Command: []string{"sh", "-c", "for i in 1 2 3; do echo line$i; sleep 0.5; done; sleep 10"},
+				}},
+				RestartPolicy: corev1.RestartPolicyNever,
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/logs-stream-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Stream logs
+		lines := make([]string, 0)
+		stop := ctx.LogsStream("logs-stream-test", func(line string) {
+			lines = append(lines, line)
+		})
+		defer stop()
+
+		// Wait for some logs
+		time.Sleep(3 * time.Second)
+
+		if len(lines) < 3 {
+			t.Errorf("expected at least 3 log lines, got %d", len(lines))
+		}
+	})
+}
+
+// TestCopyToPod verifies copying a file to a pod.
+func TestCopyToPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "copy-test"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "main",
+					Image:   "busybox",
+					Command: []string{"sleep", "300"},
+				}},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/copy-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Create a local temp file
+		tmpDir := t.TempDir()
+		localPath := filepath.Join(tmpDir, "testfile.txt")
+		content := "hello from ilmari"
+		if err := os.WriteFile(localPath, []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write temp file: %v", err)
+		}
+
+		// Copy to pod
+		if err := ctx.CopyTo("copy-test", localPath, "/tmp/testfile.txt"); err != nil {
+			t.Fatalf("CopyTo failed: %v", err)
+		}
+
+		// Verify file exists in pod
+		output, err := ctx.Exec("copy-test", []string{"cat", "/tmp/testfile.txt"})
+		if err != nil {
+			t.Fatalf("Exec failed: %v", err)
+		}
+
+		if strings.TrimSpace(output) != content {
+			t.Errorf("expected %q, got %q", content, output)
+		}
+	})
+}
+
+// TestCopyFromPod verifies copying a file from a pod.
+func TestCopyFromPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod with a file
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "copy-from-test"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "main",
+					Image:   "busybox",
+					Command: []string{"sh", "-c", "echo 'hello from pod' > /tmp/podfile.txt && sleep 300"},
+				}},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/copy-from-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait for file to be created
+		time.Sleep(1 * time.Second)
+
+		// Copy from pod
+		tmpDir := t.TempDir()
+		localPath := filepath.Join(tmpDir, "downloaded.txt")
+
+		if err := ctx.CopyFrom("copy-from-test", "/tmp/podfile.txt", localPath); err != nil {
+			t.Fatalf("CopyFrom failed: %v", err)
+		}
+
+		// Verify local file
+		data, err := os.ReadFile(localPath)
+		if err != nil {
+			t.Fatalf("Failed to read downloaded file: %v", err)
+		}
+
+		if !strings.Contains(string(data), "hello from pod") {
+			t.Errorf("expected 'hello from pod', got %q", string(data))
+		}
+	})
+}

@@ -14,6 +14,9 @@
 package ilmari
 
 import (
+	"archive/tar"
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -1283,6 +1286,52 @@ func (c *Context) Logs(pod string) (result string, err error) {
 	return buf.String(), nil
 }
 
+// LogsStream streams logs from a pod in real-time.
+// Returns a stop function to cancel the stream.
+// Each line is passed to the callback as it arrives.
+func (c *Context) LogsStream(pod string, callback func(line string)) func() {
+	_, span := c.startSpan(context.Background(), "ilmari.LogsStream",
+		attribute.String("pod", pod))
+
+	stopChan := make(chan struct{})
+
+	go func() {
+		defer span.End()
+
+		req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{
+			Follow: true,
+		})
+
+		stream, err := req.Stream(context.Background())
+		if err != nil {
+			span.RecordError(err)
+			return
+		}
+		defer stream.Close()
+
+		reader := bufio.NewReader(stream)
+		for {
+			select {
+			case <-stopChan:
+				return
+			default:
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					if err != io.EOF {
+						span.RecordError(err)
+					}
+					return
+				}
+				callback(strings.TrimSuffix(line, "\n"))
+			}
+		}
+	}()
+
+	return func() {
+		close(stopChan)
+	}
+}
+
 // Events returns all events in the test namespace.
 func (c *Context) Events() (events []corev1.Event, err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.Events")
@@ -1355,6 +1404,169 @@ func (c *Context) Exec(pod string, cmd []string) (result string, err error) {
 	}
 
 	return stdout.String(), nil
+}
+
+// CopyTo copies a local file to a pod.
+// Uses tar to transfer the file via exec.
+func (c *Context) CopyTo(pod, localPath, remotePath string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.CopyTo",
+		attribute.String("pod", pod),
+		attribute.String("local", localPath),
+		attribute.String("remote", remotePath))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Read local file
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to read local file: %w", err)
+	}
+
+	// Get config for exec
+	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	execScheme := runtime.NewScheme()
+	if err = corev1.AddToScheme(execScheme); err != nil {
+		return fmt.Errorf("failed to add scheme: %w", err)
+	}
+
+	// Create tar archive in memory
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+
+	// Get remote filename from path
+	remoteDir := filepath.Dir(remotePath)
+	remoteFile := filepath.Base(remotePath)
+
+	// Add file to tar
+	hdr := &tar.Header{
+		Name: remoteFile,
+		Mode: 0644,
+		Size: int64(len(data)),
+	}
+	if err = tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("failed to write tar header: %w", err)
+	}
+	if _, err = tw.Write(data); err != nil {
+		return fmt.Errorf("failed to write tar data: %w", err)
+	}
+	if err = tw.Close(); err != nil {
+		return fmt.Errorf("failed to close tar: %w", err)
+	}
+
+	// Execute tar extract in pod
+	req := c.Client.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod).
+		Namespace(c.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: []string{"tar", "-xf", "-", "-C", remoteDir},
+			Stdin:   true,
+			Stdout:  true,
+			Stderr:  true,
+		}, runtime.NewParameterCodec(execScheme))
+
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var stdout, stderr strings.Builder
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdin:  &tarBuf,
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("copy failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	return nil
+}
+
+// CopyFrom copies a file from a pod to a local path.
+// Uses tar to transfer the file via exec.
+func (c *Context) CopyFrom(pod, remotePath, localPath string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.CopyFrom",
+		attribute.String("pod", pod),
+		attribute.String("remote", remotePath),
+		attribute.String("local", localPath))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Get config for exec
+	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	execScheme := runtime.NewScheme()
+	if err = corev1.AddToScheme(execScheme); err != nil {
+		return fmt.Errorf("failed to add scheme: %w", err)
+	}
+
+	// Execute tar create in pod
+	remoteDir := filepath.Dir(remotePath)
+	remoteFile := filepath.Base(remotePath)
+
+	req := c.Client.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod).
+		Namespace(c.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: []string{"tar", "-cf", "-", "-C", remoteDir, remoteFile},
+			Stdout:  true,
+			Stderr:  true,
+		}, runtime.NewParameterCodec(execScheme))
+
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var tarBuf, stderr bytes.Buffer
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &tarBuf,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("copy failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	// Extract from tar
+	tr := tar.NewReader(&tarBuf)
+	hdr, err := tr.Next()
+	if err != nil {
+		return fmt.Errorf("failed to read tar header: %w", err)
+	}
+
+	// Create local file
+	outFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local file: %w", err)
+	}
+	defer outFile.Close()
+
+	if _, err = io.CopyN(outFile, tr, hdr.Size); err != nil {
+		return fmt.Errorf("failed to write local file: %w", err)
+	}
+
+	return nil
 }
 
 // PortForward represents an active port forward to a pod or service.
