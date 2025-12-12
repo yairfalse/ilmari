@@ -1031,25 +1031,37 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 		var watcher watch.Interface
 		var err error
 
-		switch kind {
-		case "pod":
-			watcher, err = c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		case "deployment":
-			watcher, err = c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		case "configmap":
-			watcher, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		case "secret":
-			watcher, err = c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		case "service":
-			watcher, err = c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		case "statefulset":
-			watcher, err = c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		case "daemonset":
-			watcher, err = c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		default:
+		// Map of kind to watcher factory functions
+		watcherFactories := map[string]func(ctx context.Context, c *Context) (watch.Interface, error){
+			"pod": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"deployment": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"configmap": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"secret": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"service": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"statefulset": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"daemonset": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+		}
+
+		factory, ok := watcherFactories[kind]
+		if !ok {
 			span.RecordError(fmt.Errorf("unsupported kind: %s", kind))
 			return
 		}
+		watcher, err = factory(ctx, c)
 
 		if err != nil {
 			span.RecordError(err)
