@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1793,14 +1794,19 @@ func TestWatchReceivesEvents(t *testing.T) {
 	}
 
 	Run(t, func(ctx *Context) {
+		var mu sync.Mutex
 		events := make([]WatchEvent, 0)
 		done := make(chan struct{})
+		var doneOnce sync.Once
 
 		// Start watching ConfigMaps
 		stop := ctx.Watch("configmap", func(event WatchEvent) {
+			mu.Lock()
 			events = append(events, event)
-			if len(events) >= 2 {
-				close(done)
+			eventCount := len(events)
+			mu.Unlock()
+			if eventCount >= 2 {
+				doneOnce.Do(func() { close(done) })
 			}
 		})
 		defer stop()
@@ -1824,18 +1830,25 @@ func TestWatchReceivesEvents(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			t.Fatalf("timeout waiting for watch events, got %d", len(events))
+			mu.Lock()
+			eventCount := len(events)
+			mu.Unlock()
+			t.Fatalf("timeout waiting for watch events, got %d", eventCount)
 		}
 
 		// Verify events
-		if len(events) < 2 {
-			t.Fatalf("expected at least 2 events, got %d", len(events))
+		mu.Lock()
+		eventsCopy := make([]WatchEvent, len(events))
+		copy(eventsCopy, events)
+		mu.Unlock()
+		if len(eventsCopy) < 2 {
+			t.Fatalf("expected at least 2 events, got %d", len(eventsCopy))
 		}
-		if events[0].Type != "ADDED" {
-			t.Errorf("expected first event ADDED, got %s", events[0].Type)
+		if eventsCopy[0].Type != "ADDED" {
+			t.Errorf("expected first event ADDED, got %s", eventsCopy[0].Type)
 		}
-		if events[1].Type != "MODIFIED" {
-			t.Errorf("expected second event MODIFIED, got %s", events[1].Type)
+		if eventsCopy[1].Type != "MODIFIED" {
+			t.Errorf("expected second event MODIFIED, got %s", eventsCopy[1].Type)
 		}
 	})
 }
@@ -1859,7 +1872,9 @@ func TestWaitDeletedWaitsForRemoval(t *testing.T) {
 		// Delete it in background
 		go func() {
 			time.Sleep(500 * time.Millisecond)
-			ctx.Delete("delete-test", &corev1.ConfigMap{})
+			if err := ctx.Delete("delete-test", &corev1.ConfigMap{}); err != nil {
+				t.Errorf("Delete in goroutine failed: %v", err)
+			}
 		}()
 
 		// WaitDeleted should block until it's gone
@@ -1940,18 +1955,24 @@ func TestLogsStreamReceivesLogs(t *testing.T) {
 			t.Fatalf("WaitReady failed: %v", err)
 		}
 
-		// Stream logs
+		// Stream logs with mutex-protected slice
+		var mu sync.Mutex
 		lines := make([]string, 0)
 		stop := ctx.LogsStream("logs-stream-test", func(line string) {
+			mu.Lock()
 			lines = append(lines, line)
+			mu.Unlock()
 		})
 		defer stop()
 
 		// Wait for some logs
 		time.Sleep(3 * time.Second)
 
-		if len(lines) < 3 {
-			t.Errorf("expected at least 3 log lines, got %d", len(lines))
+		mu.Lock()
+		lineCount := len(lines)
+		mu.Unlock()
+		if lineCount < 3 {
+			t.Errorf("expected at least 3 log lines, got %d", lineCount)
 		}
 	})
 }

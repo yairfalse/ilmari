@@ -2933,6 +2933,12 @@ func (f *FixtureBuilder) Build() (*appsv1.Deployment, error) {
 // releaseName is the name for the release.
 // values are overrides for the chart's values.yaml.
 // Returns unstructured objects that can be passed to Apply.
+//
+// LIMITATIONS: This uses Go's text/template, NOT the full Helm template engine.
+// Supported: {{ .Values.x }}, {{ .Release.Name }}, basic if/range/with.
+// NOT supported: Helm-specific functions (include, tpl, lookup), subcharts,
+// hooks, capabilities checks, complex sprig functions.
+// For complex charts, use the official Helm SDK or 'helm template' CLI.
 func FromHelm(chartPath, releaseName string, values map[string]interface{}) ([]runtime.Object, error) {
 	// Read Chart.yaml
 	chartYamlPath := filepath.Join(chartPath, "Chart.yaml")
@@ -3312,13 +3318,7 @@ func (c *Context) Rollback(resource string) (err error) {
 		return fmt.Errorf("failed to list replicasets: %w", err)
 	}
 
-	// Find the previous ReplicaSet (second newest by revision)
-	if len(rsList.Items) < 2 {
-		err = fmt.Errorf("no previous revision to rollback to")
-		return err
-	}
-
-	// Sort by revision
+	// Sort by revision - only include ReplicaSets with valid revision annotations
 	type rsWithRevision struct {
 		rs       appsv1.ReplicaSet
 		revision int64
@@ -3346,6 +3346,7 @@ func (c *Context) Rollback(resource string) (err error) {
 	if len(revisions) < 2 {
 		return fmt.Errorf("no previous revision to rollback to (found %d valid revisions)", len(revisions))
 	}
+
 	// Get the previous revision (index 1)
 	previousRS := revisions[1].rs
 
