@@ -1057,18 +1057,36 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 		}
 		defer watcher.Stop()
 
+		// Use a buffered channel to decouple event delivery from callback execution.
+		eventChan := make(chan WatchEvent, 100)
+
+		// Goroutine to invoke the callback for each event.
+		go func() {
+			for evt := range eventChan {
+				callback(evt)
+			}
+		}()
+
 		for {
 			select {
 			case <-stopChan:
+				close(eventChan)
 				return
 			case event, ok := <-watcher.ResultChan():
 				if !ok {
+					close(eventChan)
 					return
 				}
-				callback(WatchEvent{
+				evt := WatchEvent{
 					Type:   string(event.Type),
 					Object: event.Object,
-				})
+				}
+				// Non-blocking send; drop event if buffer is full to avoid blocking.
+				select {
+				case eventChan <- evt:
+				default:
+					// Optionally log or handle dropped events here.
+				}
 			}
 		}
 	}()
