@@ -1242,24 +1242,43 @@ func (c *Context) Patch(resource string, patch []byte, patchType PatchType) (err
 
 	ctx := context.Background()
 
-	switch kind {
-	case "pod":
-		_, err = c.Client.CoreV1().Pods(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	case "deployment":
-		_, err = c.Client.AppsV1().Deployments(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	case "configmap":
-		_, err = c.Client.CoreV1().ConfigMaps(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	case "secret":
-		_, err = c.Client.CoreV1().Secrets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	case "service":
-		_, err = c.Client.CoreV1().Services(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	case "statefulset":
-		_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	case "daemonset":
-		_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
-	default:
-		err = fmt.Errorf("unsupported kind: %s", kind)
+	patchFuncs := map[string]func() error{
+		"pod": func() error {
+			_, e := c.Client.CoreV1().Pods(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"deployment": func() error {
+			_, e := c.Client.AppsV1().Deployments(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"configmap": func() error {
+			_, e := c.Client.CoreV1().ConfigMaps(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"secret": func() error {
+			_, e := c.Client.CoreV1().Secrets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"service": func() error {
+			_, e := c.Client.CoreV1().Services(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"statefulset": func() error {
+			_, e := c.Client.AppsV1().StatefulSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"daemonset": func() error {
+			_, e := c.Client.AppsV1().DaemonSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
 	}
+
+	patchFunc, ok := patchFuncs[kind]
+	if !ok {
+		err = fmt.Errorf("unsupported kind: %s", kind)
+		return err
+	}
+	err = patchFunc()
 
 	return err
 }
