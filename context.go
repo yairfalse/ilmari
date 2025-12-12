@@ -1167,59 +1167,64 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) (er
 func (c *Context) resourceExists(kind, name string) (bool, error) {
 	ctx := context.Background()
 
-	switch kind {
-	case "pod":
-		_, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
+	type existsFunc func(ctx context.Context, c *Context, name string) (bool, error)
 
-	case "deployment":
-		_, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
-
-	case "configmap":
-		_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
-
-	case "secret":
-		_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
-
-	case "service":
-		_, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
-
-	case "statefulset":
-		_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
-
-	case "daemonset":
-		_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return err == nil, err
-
-	default:
-		return false, fmt.Errorf("unsupported kind: %s", kind)
+	resourceFuncs := map[string]existsFunc{
+		"pod": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"deployment": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"configmap": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"secret": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"service": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"statefulset": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"daemonset": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
 	}
+
+	if fn, ok := resourceFuncs[kind]; ok {
+		return fn(ctx, c, name)
+	}
+	return false, fmt.Errorf("unsupported kind: %s", kind)
 }
 
 // PatchType specifies the type of patch operation.
