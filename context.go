@@ -3303,6 +3303,10 @@ func (c *Context) Rollback(resource string) (err error) {
 		return revisions[i].revision > revisions[j].revision
 	})
 
+	// Ensure there are at least two revisions after sorting
+	if len(revisions) < 2 {
+		return fmt.Errorf("no previous revision to rollback to (found %d valid revisions)", len(revisions))
+	}
 	// Get the previous revision (index 1)
 	previousRS := revisions[1].rs
 
