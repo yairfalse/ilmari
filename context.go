@@ -14,6 +14,9 @@
 package ilmari
 
 import (
+	"archive/tar"
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -22,13 +25,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
+	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,7 +44,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -994,6 +1002,322 @@ func isDaemonSetReady(ds *appsv1.DaemonSet) bool {
 		ds.Status.DesiredNumberScheduled > 0
 }
 
+// ============================================================================
+// Watch, WaitDeleted, Patch - Phase 1 Core Primitives
+// ============================================================================
+
+// WatchEvent represents a Kubernetes watch event.
+type WatchEvent struct {
+	Type   string      // ADDED, MODIFIED, DELETED
+	Object interface{} // The resource object
+}
+
+// Watch starts watching resources of the given kind.
+// Returns a stop function to cancel the watch. Safe to call multiple times.
+// The callback is invoked for each event (ADDED, MODIFIED, DELETED).
+func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
+	_, span := c.startSpan(context.Background(), "ilmari.Watch",
+		attribute.String("kind", kind))
+
+	stopChan := make(chan struct{})
+	var stopOnce sync.Once
+
+	go func() {
+		defer span.End()
+
+		ctx := context.Background()
+		kind = strings.ToLower(kind)
+
+		var watcher watch.Interface
+		var err error
+
+		// Map of kind to watcher factory functions
+		watcherFactories := map[string]func(ctx context.Context, c *Context) (watch.Interface, error){
+			"pod": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"deployment": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"configmap": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"secret": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"service": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"statefulset": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+			"daemonset": func(ctx context.Context, c *Context) (watch.Interface, error) {
+				return c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+			},
+		}
+
+		factory, ok := watcherFactories[kind]
+		if !ok {
+			span.RecordError(fmt.Errorf("unsupported kind: %s", kind))
+			return
+		}
+		watcher, err = factory(ctx, c)
+
+		if err != nil {
+			span.RecordError(err)
+			return
+		}
+		defer watcher.Stop()
+
+		// Use a buffered channel to decouple event delivery from callback execution.
+		eventChan := make(chan WatchEvent, 100)
+
+		// Goroutine to invoke the callback for each event.
+		go func() {
+			for evt := range eventChan {
+				callback(evt)
+			}
+		}()
+
+		for {
+			select {
+			case <-stopChan:
+				close(eventChan)
+				return
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					close(eventChan)
+					return
+				}
+				evt := WatchEvent{
+					Type:   string(event.Type),
+					Object: event.Object,
+				}
+				// Non-blocking send; drop event if buffer is full to avoid blocking.
+				select {
+				case eventChan <- evt:
+				default:
+					// Optionally log or handle dropped events here.
+				}
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+	}
+}
+
+// WaitDeleted waits for a resource to be deleted.
+// Resource format: "kind/name" (e.g., "pod/myapp", "configmap/myconfig")
+func (c *Context) WaitDeleted(resource string) error {
+	return c.WaitDeletedTimeout(resource, 60*time.Second)
+}
+
+// WaitDeletedTimeout waits for a resource to be deleted with custom timeout.
+func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitDeleted",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		exists, checkErr := c.resourceExists(kind, name)
+		if checkErr != nil {
+			err = checkErr
+			return err
+		}
+		if !exists {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			err = fmt.Errorf("timeout waiting for %s to be deleted", resource)
+			return err
+		case <-ticker.C:
+		}
+	}
+}
+
+// resourceExists checks if a resource exists.
+func (c *Context) resourceExists(kind, name string) (bool, error) {
+	ctx := context.Background()
+
+	type existsFunc func(ctx context.Context, c *Context, name string) (bool, error)
+
+	resourceFuncs := map[string]existsFunc{
+		"pod": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"deployment": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"configmap": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"secret": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"service": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"statefulset": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+		"daemonset": func(ctx context.Context, c *Context, name string) (bool, error) {
+			_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return err == nil, err
+		},
+	}
+
+	if fn, ok := resourceFuncs[kind]; ok {
+		return fn(ctx, c, name)
+	}
+	return false, fmt.Errorf("unsupported kind: %s", kind)
+}
+
+// PatchType specifies the type of patch operation.
+type PatchType string
+
+const (
+	// PatchStrategic uses strategic merge patch (default for K8s resources)
+	PatchStrategic PatchType = "strategic"
+	// PatchMerge uses JSON merge patch (RFC 7386)
+	PatchMerge PatchType = "merge"
+	// PatchJSON uses JSON patch (RFC 6902)
+	PatchJSON PatchType = "json"
+)
+
+// Patch applies a patch to a resource.
+// Resource format: "kind/name" (e.g., "deployment/myapp")
+func (c *Context) Patch(resource string, patch []byte, patchType PatchType) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Patch",
+		attribute.String("resource", resource),
+		attribute.String("patch_type", string(patchType)))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	// Convert PatchType to Kubernetes patch type
+	var k8sPatchType types.PatchType
+	switch patchType {
+	case PatchStrategic:
+		k8sPatchType = types.StrategicMergePatchType
+	case PatchMerge:
+		k8sPatchType = types.MergePatchType
+	case PatchJSON:
+		k8sPatchType = types.JSONPatchType
+	default:
+		k8sPatchType = types.StrategicMergePatchType
+	}
+
+	ctx := context.Background()
+
+	patchFuncs := map[string]func() error{
+		"pod": func() error {
+			_, e := c.Client.CoreV1().Pods(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"deployment": func() error {
+			_, e := c.Client.AppsV1().Deployments(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"configmap": func() error {
+			_, e := c.Client.CoreV1().ConfigMaps(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"secret": func() error {
+			_, e := c.Client.CoreV1().Secrets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"service": func() error {
+			_, e := c.Client.CoreV1().Services(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"statefulset": func() error {
+			_, e := c.Client.AppsV1().StatefulSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+		"daemonset": func() error {
+			_, e := c.Client.AppsV1().DaemonSets(c.Namespace).Patch(ctx, name, k8sPatchType, patch, metav1.PatchOptions{})
+			return e
+		},
+	}
+
+	patchFunc, ok := patchFuncs[kind]
+	if !ok {
+		err = fmt.Errorf("unsupported kind: %s", kind)
+		return err
+	}
+	err = patchFunc()
+
+	return err
+}
+
 // Logs retrieves logs from a pod.
 func (c *Context) Logs(pod string) (result string, err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.Logs",
@@ -1020,6 +1344,55 @@ func (c *Context) Logs(pod string) (result string, err error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// LogsStream streams logs from a pod in real-time.
+// Returns a stop function to cancel the stream. Safe to call multiple times.
+// Each line is passed to the callback as it arrives.
+func (c *Context) LogsStream(pod string, callback func(line string)) func() {
+	_, span := c.startSpan(context.Background(), "ilmari.LogsStream",
+		attribute.String("pod", pod))
+
+	stopChan := make(chan struct{})
+	var stopOnce sync.Once
+
+	go func() {
+		defer span.End()
+
+		req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{
+			Follow: true,
+		})
+
+		stream, err := req.Stream(context.Background())
+		if err != nil {
+			span.RecordError(err)
+			return
+		}
+		defer stream.Close()
+
+		reader := bufio.NewReader(stream)
+		for {
+			select {
+			case <-stopChan:
+				return
+			default:
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					if err != io.EOF {
+						span.RecordError(err)
+					}
+					return
+				}
+				callback(strings.TrimSuffix(line, "\n"))
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+	}
 }
 
 // Events returns all events in the test namespace.
@@ -1094,6 +1467,169 @@ func (c *Context) Exec(pod string, cmd []string) (result string, err error) {
 	}
 
 	return stdout.String(), nil
+}
+
+// CopyTo copies a local file to a pod.
+// Uses tar to transfer the file via exec.
+func (c *Context) CopyTo(pod, localPath, remotePath string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.CopyTo",
+		attribute.String("pod", pod),
+		attribute.String("local", localPath),
+		attribute.String("remote", remotePath))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Read local file
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to read local file: %w", err)
+	}
+
+	// Get config for exec
+	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	execScheme := runtime.NewScheme()
+	if err = corev1.AddToScheme(execScheme); err != nil {
+		return fmt.Errorf("failed to add scheme: %w", err)
+	}
+
+	// Create tar archive in memory
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+
+	// Get remote filename from path
+	remoteDir := filepath.Dir(remotePath)
+	remoteFile := filepath.Base(remotePath)
+
+	// Add file to tar
+	hdr := &tar.Header{
+		Name: remoteFile,
+		Mode: 0644,
+		Size: int64(len(data)),
+	}
+	if err = tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("failed to write tar header: %w", err)
+	}
+	if _, err = tw.Write(data); err != nil {
+		return fmt.Errorf("failed to write tar data: %w", err)
+	}
+	if err = tw.Close(); err != nil {
+		return fmt.Errorf("failed to close tar: %w", err)
+	}
+
+	// Execute tar extract in pod
+	req := c.Client.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod).
+		Namespace(c.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: []string{"tar", "-xf", "-", "-C", remoteDir},
+			Stdin:   true,
+			Stdout:  true,
+			Stderr:  true,
+		}, runtime.NewParameterCodec(execScheme))
+
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var stdout, stderr strings.Builder
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdin:  &tarBuf,
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("copy failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	return nil
+}
+
+// CopyFrom copies a file from a pod to a local path.
+// Uses tar to transfer the file via exec.
+func (c *Context) CopyFrom(pod, remotePath, localPath string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.CopyFrom",
+		attribute.String("pod", pod),
+		attribute.String("remote", remotePath),
+		attribute.String("local", localPath))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Get config for exec
+	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
+
+	execScheme := runtime.NewScheme()
+	if err = corev1.AddToScheme(execScheme); err != nil {
+		return fmt.Errorf("failed to add scheme: %w", err)
+	}
+
+	// Execute tar create in pod
+	remoteDir := filepath.Dir(remotePath)
+	remoteFile := filepath.Base(remotePath)
+
+	req := c.Client.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod).
+		Namespace(c.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: []string{"tar", "-cf", "-", "-C", remoteDir, remoteFile},
+			Stdout:  true,
+			Stderr:  true,
+		}, runtime.NewParameterCodec(execScheme))
+
+	executor, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var tarBuf, stderr bytes.Buffer
+	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &tarBuf,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("copy failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	// Extract from tar
+	tr := tar.NewReader(&tarBuf)
+	hdr, err := tr.Next()
+	if err != nil {
+		return fmt.Errorf("failed to read tar header: %w", err)
+	}
+
+	// Create local file
+	outFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local file: %w", err)
+	}
+	defer outFile.Close()
+
+	if _, err = io.CopyN(outFile, tr, hdr.Size); err != nil {
+		return fmt.Errorf("failed to write local file: %w", err)
+	}
+
+	return nil
 }
 
 // PortForward represents an active port forward to a pod or service.
@@ -2391,6 +2927,474 @@ func (f *FixtureBuilder) Build() (*appsv1.Deployment, error) {
 		return nil, f.err
 	}
 	return f.deploy, nil
+}
+
+// ============================================================================
+// Phase 2: Composition & Import - Helm, CRDs, Dynamic
+// ============================================================================
+
+// FromHelm renders a Helm chart to Kubernetes objects.
+// chartPath is the path to the chart directory.
+// releaseName is the name for the release.
+// values are overrides for the chart's values.yaml.
+// Returns unstructured objects that can be passed to Apply.
+//
+// LIMITATIONS: This uses Go's text/template, NOT the full Helm template engine.
+// Supported: {{ .Values.x }}, {{ .Release.Name }}, basic if/range/with.
+// NOT supported: Helm-specific functions (include, tpl, lookup), subcharts,
+// hooks, capabilities checks, complex sprig functions.
+// For complex charts, use the official Helm SDK or 'helm template' CLI.
+func FromHelm(chartPath, releaseName string, values map[string]interface{}) ([]runtime.Object, error) {
+	// Read Chart.yaml
+	chartYamlPath := filepath.Join(chartPath, "Chart.yaml")
+	if _, err := os.Stat(chartYamlPath); err != nil {
+		return nil, fmt.Errorf("Chart.yaml not found: %w", err)
+	}
+
+	// Read default values
+	defaultValues := make(map[string]interface{})
+	valuesPath := filepath.Join(chartPath, "values.yaml")
+	if data, err := os.ReadFile(valuesPath); err == nil {
+		if err := yaml.Unmarshal(data, &defaultValues); err != nil {
+			return nil, fmt.Errorf("failed to parse values.yaml: %w", err)
+		}
+	}
+
+	// Merge with provided values (provided values take precedence)
+	mergedValues := mergeMaps(defaultValues, values)
+
+	// Build template context
+	templateContext := map[string]interface{}{
+		"Values": mergedValues,
+		"Release": map[string]interface{}{
+			"Name":      releaseName,
+			"Namespace": "default", // Will be overridden when applied
+		},
+		"Chart": map[string]interface{}{
+			"Name": filepath.Base(chartPath),
+		},
+	}
+
+	// Find all templates
+	templatesDir := filepath.Join(chartPath, "templates")
+	templateFiles, err := filepath.Glob(filepath.Join(templatesDir, "*.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to find templates: %w", err)
+	}
+
+	var objects []runtime.Object
+
+	for _, tmplPath := range templateFiles {
+		// Skip partials/helpers
+		if strings.HasPrefix(filepath.Base(tmplPath), "_") {
+			continue
+		}
+
+		// Read template
+		tmplData, err := os.ReadFile(tmplPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read template %s: %w", tmplPath, err)
+		}
+
+		// Parse and execute template
+		tmpl, err := template.New(filepath.Base(tmplPath)).Parse(string(tmplData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse template %s: %w", tmplPath, err)
+		}
+
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, templateContext); err != nil {
+			return nil, fmt.Errorf("failed to execute template %s: %w", tmplPath, err)
+		}
+
+		// Skip empty templates
+		rendered := strings.TrimSpace(buf.String())
+		if rendered == "" {
+			continue
+		}
+
+		// Parse YAML to unstructured
+		obj := &unstructured.Unstructured{}
+		if err := yaml.Unmarshal([]byte(rendered), &obj.Object); err != nil {
+			return nil, fmt.Errorf("failed to parse rendered template %s: %w", tmplPath, err)
+		}
+
+		objects = append(objects, obj)
+	}
+
+	return objects, nil
+}
+
+// mergeMaps merges two maps, with values from b taking precedence.
+func mergeMaps(a, b map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for k, v := range a {
+		result[k] = v
+	}
+	for k, v := range b {
+		result[k] = v
+	}
+	return result
+}
+
+// ApplyDynamic applies an unstructured object using the dynamic client.
+// Useful for CRDs or when you don't have typed structs.
+func (c *Context) ApplyDynamic(gvr schema.GroupVersionResource, obj map[string]interface{}) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.ApplyDynamic",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Set namespace if not set
+	metadata, ok := obj["metadata"].(map[string]interface{})
+	if !ok {
+		metadata = make(map[string]interface{})
+		obj["metadata"] = metadata
+	}
+	if _, ok := metadata["namespace"]; !ok {
+		metadata["namespace"] = c.Namespace
+	}
+
+	u := &unstructured.Unstructured{Object: obj}
+	name := u.GetName()
+
+	ctx := context.Background()
+
+	// Try to get existing resource
+	_, getErr := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(getErr) {
+		// Create
+		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, u, metav1.CreateOptions{})
+	} else if getErr != nil {
+		err = getErr
+	} else {
+		// Update
+		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, u, metav1.UpdateOptions{})
+	}
+
+	return err
+}
+
+// GetDynamic retrieves an object using the dynamic client.
+// Returns the object as a map[string]interface{}.
+func (c *Context) GetDynamic(gvr schema.GroupVersionResource, name string) (result map[string]interface{}, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.GetDynamic",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	u, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return u.Object, nil
+}
+
+// DeleteDynamic deletes an object using the dynamic client.
+func (c *Context) DeleteDynamic(gvr schema.GroupVersionResource, name string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.DeleteDynamic",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource),
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	return err
+}
+
+// ListDynamic lists objects using the dynamic client.
+func (c *Context) ListDynamic(gvr schema.GroupVersionResource) (result []map[string]interface{}, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.ListDynamic",
+		attribute.String("group", gvr.Group),
+		attribute.String("version", gvr.Version),
+		attribute.String("resource", gvr.Resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	list, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	result = make([]map[string]interface{}, len(list.Items))
+	for i, item := range list.Items {
+		result[i] = item.Object
+	}
+
+	return result, nil
+}
+
+// ============================================================================
+// Phase 3: Operational Primitives - Scale, Restart, Rollback, CanI
+// ============================================================================
+
+// Scale changes the replica count of a deployment or statefulset.
+// Resource format: "kind/name" (e.g., "deployment/myapp", "statefulset/mydb")
+func (c *Context) Scale(resource string, replicas int) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Scale",
+		attribute.String("resource", resource),
+		attribute.Int("replicas", replicas))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+	ctx := context.Background()
+	r := int32(replicas)
+
+	switch kind {
+	case "deployment":
+		deploy, getErr := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			err = getErr
+			return err
+		}
+		deploy.Spec.Replicas = &r
+		_, err = c.Client.AppsV1().Deployments(c.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
+
+	case "statefulset":
+		ss, getErr := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			err = getErr
+			return err
+		}
+		ss.Spec.Replicas = &r
+		_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Update(ctx, ss, metav1.UpdateOptions{})
+
+	default:
+		err = fmt.Errorf("Scale not supported for kind: %s", kind)
+	}
+
+	return err
+}
+
+// Restart triggers a rolling restart by updating the pod template annotation.
+// Resource format: "kind/name" (e.g., "deployment/myapp")
+func (c *Context) Restart(resource string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Restart",
+		attribute.String("resource", resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+	ctx := context.Background()
+	restartedAt := time.Now().Format(time.RFC3339)
+
+	switch kind {
+	case "deployment":
+		deploy, getErr := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			err = getErr
+			return err
+		}
+		if deploy.Spec.Template.Annotations == nil {
+			deploy.Spec.Template.Annotations = make(map[string]string)
+		}
+		deploy.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartedAt
+		_, err = c.Client.AppsV1().Deployments(c.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
+
+	case "statefulset":
+		ss, getErr := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			err = getErr
+			return err
+		}
+		if ss.Spec.Template.Annotations == nil {
+			ss.Spec.Template.Annotations = make(map[string]string)
+		}
+		ss.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartedAt
+		_, err = c.Client.AppsV1().StatefulSets(c.Namespace).Update(ctx, ss, metav1.UpdateOptions{})
+
+	case "daemonset":
+		ds, getErr := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			err = getErr
+			return err
+		}
+		if ds.Spec.Template.Annotations == nil {
+			ds.Spec.Template.Annotations = make(map[string]string)
+		}
+		ds.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = restartedAt
+		_, err = c.Client.AppsV1().DaemonSets(c.Namespace).Update(ctx, ds, metav1.UpdateOptions{})
+
+	default:
+		err = fmt.Errorf("Restart not supported for kind: %s", kind)
+	}
+
+	return err
+}
+
+// Rollback rolls back a deployment to the previous revision.
+// Resource format: "deployment/name"
+func (c *Context) Rollback(resource string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.Rollback",
+		attribute.String("resource", resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	parts := strings.SplitN(resource, "/", 2)
+	if len(parts) != 2 {
+		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return err
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "deployment" {
+		err = fmt.Errorf("Rollback only supported for deployments, got: %s", kind)
+		return err
+	}
+
+	ctx := context.Background()
+
+	// Get deployment
+	deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Get ReplicaSets for this deployment
+	selector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
+	if err != nil {
+		return fmt.Errorf("failed to parse selector: %w", err)
+	}
+
+	rsList, err := c.Client.AppsV1().ReplicaSets(c.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list replicasets: %w", err)
+	}
+
+	// Sort by revision - only include ReplicaSets with valid revision annotations
+	type rsWithRevision struct {
+		rs       appsv1.ReplicaSet
+		revision int64
+	}
+	var revisions []rsWithRevision
+	for _, rs := range rsList.Items {
+		revStr := rs.Annotations["deployment.kubernetes.io/revision"]
+		rev, err := strconv.ParseInt(revStr, 10, 64)
+		if err != nil {
+			msg := fmt.Sprintf("Warning: ReplicaSet %q in namespace %q has invalid or missing revision annotation: %q (error: %v); skipping", rs.Name, rs.Namespace, revStr, err)
+			if c.t != nil {
+				c.t.Log(msg)
+			} else {
+				fmt.Println(msg)
+			}
+			continue
+		}
+		revisions = append(revisions, rsWithRevision{rs: rs, revision: rev})
+	}
+	sort.Slice(revisions, func(i, j int) bool {
+		return revisions[i].revision > revisions[j].revision
+	})
+
+	// Ensure there are at least two revisions after sorting
+	if len(revisions) < 2 {
+		return fmt.Errorf("no previous revision to rollback to (found %d valid revisions)", len(revisions))
+	}
+
+	// Get the previous revision (index 1)
+	previousRS := revisions[1].rs
+
+	// Copy the pod template from previous revision
+	deploy.Spec.Template = previousRS.Spec.Template
+
+	// Update deployment
+	_, err = c.Client.AppsV1().Deployments(c.Namespace).Update(ctx, deploy, metav1.UpdateOptions{})
+	return err
+}
+
+// CanI checks if the current user has permission to perform an action.
+// verb: "get", "list", "create", "update", "delete", "watch", etc.
+// resource: "pods", "deployments", "services", etc.
+func (c *Context) CanI(verb, resource string) (allowed bool, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.CanI",
+		attribute.String("verb", verb),
+		attribute.String("resource", resource))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	review := &authv1.SelfSubjectAccessReview{
+		Spec: authv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authv1.ResourceAttributes{
+				Namespace: c.Namespace,
+				Verb:      verb,
+				Resource:  resource,
+			},
+		},
+	}
+
+	result, err := c.Client.AuthorizationV1().SelfSubjectAccessReviews().Create(
+		context.Background(), review, metav1.CreateOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	return result.Status.Allowed, nil
 }
 
 // ============================================================================

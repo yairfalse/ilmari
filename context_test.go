@@ -5,12 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // TestContextCreatesNamespace verifies that Run creates an isolated namespace.
@@ -1324,10 +1326,13 @@ spec:
 		}
 
 		// Load with overrides
-		deploy := ctx.LoadFixture(fixturePath).
+		deploy, err := ctx.LoadFixture(fixturePath).
 			WithImage("nginx:alpine").
 			WithReplicas(1).
 			Build()
+		if err != nil {
+			t.Fatalf("Build failed: %v", err)
+		}
 
 		if err := ctx.Apply(deploy); err != nil {
 			t.Fatalf("Apply failed: %v", err)
@@ -1776,4 +1781,595 @@ func TestContextCloseKeepsSharedNamespace(t *testing.T) {
 	if err != nil {
 		t.Errorf("default namespace should still exist: %v", err)
 	}
+}
+
+// ============================================================================
+// Phase 1: Core Primitives
+// ============================================================================
+
+// TestWatchReceivesEvents verifies Watch streams resource events.
+func TestWatchReceivesEvents(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		var mu sync.Mutex
+		events := make([]WatchEvent, 0)
+		done := make(chan struct{})
+		var doneOnce sync.Once
+
+		// Start watching ConfigMaps
+		stop := ctx.Watch("configmap", func(event WatchEvent) {
+			mu.Lock()
+			events = append(events, event)
+			eventCount := len(events)
+			mu.Unlock()
+			if eventCount >= 2 {
+				doneOnce.Do(func() { close(done) })
+			}
+		})
+		defer stop()
+
+		// Create a ConfigMap - should trigger ADDED event
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "watch-test"},
+			Data:       map[string]string{"key": "value1"},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Update it - should trigger MODIFIED event
+		cm.Data["key"] = "value2"
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply update failed: %v", err)
+		}
+
+		// Wait for events
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			mu.Lock()
+			eventCount := len(events)
+			mu.Unlock()
+			t.Fatalf("timeout waiting for watch events, got %d", eventCount)
+		}
+
+		// Verify events
+		mu.Lock()
+		eventsCopy := make([]WatchEvent, len(events))
+		copy(eventsCopy, events)
+		mu.Unlock()
+		if len(eventsCopy) < 2 {
+			t.Fatalf("expected at least 2 events, got %d", len(eventsCopy))
+		}
+		if eventsCopy[0].Type != "ADDED" {
+			t.Errorf("expected first event ADDED, got %s", eventsCopy[0].Type)
+		}
+		if eventsCopy[1].Type != "MODIFIED" {
+			t.Errorf("expected second event MODIFIED, got %s", eventsCopy[1].Type)
+		}
+	})
+}
+
+// TestWaitDeletedWaitsForRemoval verifies WaitDeleted blocks until resource is gone.
+func TestWaitDeletedWaitsForRemoval(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "delete-test"},
+			Data:       map[string]string{"key": "value"},
+		}
+		if err := ctx.Apply(cm); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Delete it in background
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			if err := ctx.Delete("delete-test", &corev1.ConfigMap{}); err != nil {
+				t.Errorf("Delete in goroutine failed: %v", err)
+			}
+		}()
+
+		// WaitDeleted should block until it's gone
+		err := ctx.WaitDeleted("configmap/delete-test")
+		if err != nil {
+			t.Errorf("WaitDeleted failed: %v", err)
+		}
+
+		// Verify it's actually gone
+		err = ctx.Get("delete-test", &corev1.ConfigMap{})
+		if err == nil {
+			t.Error("ConfigMap should be deleted")
+		}
+	})
+}
+
+// TestPatchStrategicMerge verifies strategic merge patch.
+func TestPatchStrategicMerge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a deployment
+		deploy := Deployment("patch-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		// Patch to add a label
+		patch := []byte(`{"metadata":{"labels":{"patched":"true"}}}`)
+		err := ctx.Patch("deployment/patch-test", patch, PatchStrategic)
+		if err != nil {
+			t.Fatalf("Patch failed: %v", err)
+		}
+
+		// Verify label was added
+		var updated appsv1.Deployment
+		if err := ctx.Get("patch-test", &updated); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if updated.Labels["patched"] != "true" {
+			t.Errorf("expected label patched=true, got %v", updated.Labels)
+		}
+	})
+}
+
+// TestLogsStreamReceivesLogs verifies LogsStream streams logs in real-time.
+func TestLogsStreamReceivesLogs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod that outputs logs
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "logs-stream-test"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "logger",
+					Image:   "busybox",
+					Command: []string{"sh", "-c", "for i in 1 2 3; do echo line$i; sleep 0.5; done; sleep 10"},
+				}},
+				RestartPolicy: corev1.RestartPolicyNever,
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/logs-stream-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Stream logs with mutex-protected slice
+		var mu sync.Mutex
+		lines := make([]string, 0)
+		stop := ctx.LogsStream("logs-stream-test", func(line string) {
+			mu.Lock()
+			lines = append(lines, line)
+			mu.Unlock()
+		})
+		defer stop()
+
+		// Wait for some logs
+		time.Sleep(3 * time.Second)
+
+		mu.Lock()
+		lineCount := len(lines)
+		mu.Unlock()
+		if lineCount < 3 {
+			t.Errorf("expected at least 3 log lines, got %d", lineCount)
+		}
+	})
+}
+
+// TestCopyToPod verifies copying a file to a pod.
+func TestCopyToPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "copy-test"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "main",
+					Image:   "busybox",
+					Command: []string{"sleep", "300"},
+				}},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/copy-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Create a local temp file
+		tmpDir := t.TempDir()
+		localPath := filepath.Join(tmpDir, "testfile.txt")
+		content := "hello from ilmari"
+		if err := os.WriteFile(localPath, []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write temp file: %v", err)
+		}
+
+		// Copy to pod
+		if err := ctx.CopyTo("copy-test", localPath, "/tmp/testfile.txt"); err != nil {
+			t.Fatalf("CopyTo failed: %v", err)
+		}
+
+		// Verify file exists in pod
+		output, err := ctx.Exec("copy-test", []string{"cat", "/tmp/testfile.txt"})
+		if err != nil {
+			t.Fatalf("Exec failed: %v", err)
+		}
+
+		if strings.TrimSpace(output) != content {
+			t.Errorf("expected %q, got %q", content, output)
+		}
+	})
+}
+
+// TestCopyFromPod verifies copying a file from a pod.
+func TestCopyFromPod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod with a file
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "copy-from-test"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:    "main",
+					Image:   "busybox",
+					Command: []string{"sh", "-c", "echo 'hello from pod' > /tmp/podfile.txt && sleep 300"},
+				}},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/copy-from-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait for file to be created
+		time.Sleep(1 * time.Second)
+
+		// Copy from pod
+		tmpDir := t.TempDir()
+		localPath := filepath.Join(tmpDir, "downloaded.txt")
+
+		if err := ctx.CopyFrom("copy-from-test", "/tmp/podfile.txt", localPath); err != nil {
+			t.Fatalf("CopyFrom failed: %v", err)
+		}
+
+		// Verify local file
+		data, err := os.ReadFile(localPath)
+		if err != nil {
+			t.Fatalf("Failed to read downloaded file: %v", err)
+		}
+
+		if !strings.Contains(string(data), "hello from pod") {
+			t.Errorf("expected 'hello from pod', got %q", string(data))
+		}
+	})
+}
+
+// ============================================================================
+// Phase 2: Composition & Import
+// ============================================================================
+
+// TestFromHelmRendersChart verifies FromHelm renders a chart to objects.
+func TestFromHelmRendersChart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	// Create a minimal helm chart structure
+	tmpDir := t.TempDir()
+	chartDir := filepath.Join(tmpDir, "mychart")
+	templatesDir := filepath.Join(chartDir, "templates")
+
+	os.MkdirAll(templatesDir, 0755)
+
+	// Chart.yaml
+	chartYaml := `apiVersion: v2
+name: mychart
+version: 0.1.0
+`
+	os.WriteFile(filepath.Join(chartDir, "Chart.yaml"), []byte(chartYaml), 0644)
+
+	// values.yaml
+	valuesYaml := `replicas: 1
+image: nginx:alpine
+`
+	os.WriteFile(filepath.Join(chartDir, "values.yaml"), []byte(valuesYaml), 0644)
+
+	// templates/deployment.yaml
+	deploymentTemplate := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-app
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      containers:
+      - name: main
+        image: {{ .Values.image }}
+`
+	os.WriteFile(filepath.Join(templatesDir, "deployment.yaml"), []byte(deploymentTemplate), 0644)
+
+	Run(t, func(ctx *Context) {
+		// Render helm chart with custom values
+		objects, err := FromHelm(chartDir, "myrelease", map[string]interface{}{
+			"replicas": 3,
+			"image":    "nginx:latest",
+		})
+		if err != nil {
+			t.Fatalf("FromHelm failed: %v", err)
+		}
+
+		if len(objects) == 0 {
+			t.Fatal("expected at least one object from helm chart")
+		}
+
+		// Apply rendered objects
+		for _, obj := range objects {
+			if err := ctx.Apply(obj); err != nil {
+				t.Fatalf("Apply failed: %v", err)
+			}
+		}
+
+		// Verify deployment was created with correct values
+		var deploy appsv1.Deployment
+		if err := ctx.Get("myrelease-app", &deploy); err != nil {
+			t.Fatalf("Get deployment failed: %v", err)
+		}
+
+		if *deploy.Spec.Replicas != 3 {
+			t.Errorf("expected 3 replicas, got %d", *deploy.Spec.Replicas)
+		}
+	})
+}
+
+// TestGetDynamicForCRD verifies GetDynamic works with arbitrary GVKs.
+func TestGetDynamicForCRD(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a ConfigMap using dynamic client (simulating CRD workflow)
+		gvr := schema.GroupVersionResource{
+			Group:    "",
+			Version:  "v1",
+			Resource: "configmaps",
+		}
+
+		obj := map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "ConfigMap",
+			"metadata": map[string]interface{}{
+				"name": "dynamic-test",
+			},
+			"data": map[string]interface{}{
+				"key": "value",
+			},
+		}
+
+		// Apply using dynamic
+		if err := ctx.ApplyDynamic(gvr, obj); err != nil {
+			t.Fatalf("ApplyDynamic failed: %v", err)
+		}
+
+		// Get using dynamic
+		result, err := ctx.GetDynamic(gvr, "dynamic-test")
+		if err != nil {
+			t.Fatalf("GetDynamic failed: %v", err)
+		}
+
+		data, ok := result["data"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected data map, got %T", result["data"])
+		}
+
+		if data["key"] != "value" {
+			t.Errorf("expected key=value, got %v", data["key"])
+		}
+	})
+}
+
+// ============================================================================
+// Phase 3: Operational Primitives
+// ============================================================================
+
+// TestScaleChangesReplicas verifies Scale changes deployment replicas.
+func TestScaleChangesReplicas(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("scale-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/scale-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Scale up
+		if err := ctx.Scale("deployment/scale-test", 3); err != nil {
+			t.Fatalf("Scale failed: %v", err)
+		}
+
+		// Verify
+		var updated appsv1.Deployment
+		if err := ctx.Get("scale-test", &updated); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if *updated.Spec.Replicas != 3 {
+			t.Errorf("expected 3 replicas, got %d", *updated.Spec.Replicas)
+		}
+	})
+}
+
+// TestRestartTriggersRollingUpdate verifies Restart triggers a rolling update.
+func TestRestartTriggersRollingUpdate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		deploy := Deployment("restart-test").
+			Image("nginx:alpine").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/restart-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Get original annotation
+		var before appsv1.Deployment
+		ctx.Get("restart-test", &before)
+		beforeAnnotations := before.Spec.Template.Annotations
+
+		// Restart
+		if err := ctx.Restart("deployment/restart-test"); err != nil {
+			t.Fatalf("Restart failed: %v", err)
+		}
+
+		// Verify restart annotation was added
+		var after appsv1.Deployment
+		ctx.Get("restart-test", &after)
+
+		restartAt := after.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"]
+		if restartAt == "" {
+			t.Error("expected restartedAt annotation to be set")
+		}
+
+		if beforeAnnotations["kubectl.kubernetes.io/restartedAt"] == restartAt {
+			t.Error("restartedAt should have changed")
+		}
+	})
+}
+
+// TestRollbackToRevision verifies Rollback reverts to previous revision.
+func TestRollbackToRevision(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create v1
+		deploy := Deployment("rollback-test").
+			Image("nginx:1.24").
+			Replicas(1).
+			Build()
+
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply v1 failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("deployment/rollback-test"); err != nil {
+			t.Fatalf("WaitReady v1 failed: %v", err)
+		}
+
+		// Update to v2
+		deploy.Spec.Template.Spec.Containers[0].Image = "nginx:1.25"
+		if err := ctx.Apply(deploy); err != nil {
+			t.Fatalf("Apply v2 failed: %v", err)
+		}
+
+		// Wait for rollout
+		time.Sleep(2 * time.Second)
+
+		// Rollback
+		if err := ctx.Rollback("deployment/rollback-test"); err != nil {
+			t.Fatalf("Rollback failed: %v", err)
+		}
+
+		// Wait for rollback
+		time.Sleep(2 * time.Second)
+
+		// Verify image is back to v1
+		var after appsv1.Deployment
+		ctx.Get("rollback-test", &after)
+
+		image := after.Spec.Template.Spec.Containers[0].Image
+		if image != "nginx:1.24" {
+			t.Errorf("expected nginx:1.24, got %s", image)
+		}
+	})
+}
+
+// TestCanIChecksPermissions verifies CanI checks RBAC permissions.
+func TestCanIChecksPermissions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Should be able to create pods in test namespace
+		canCreate, err := ctx.CanI("create", "pods")
+		if err != nil {
+			t.Fatalf("CanI failed: %v", err)
+		}
+
+		if !canCreate {
+			t.Error("expected to be able to create pods")
+		}
+
+		// Should be able to list deployments
+		canList, err := ctx.CanI("list", "deployments")
+		if err != nil {
+			t.Fatalf("CanI list failed: %v", err)
+		}
+
+		if !canList {
+			t.Error("expected to be able to list deployments")
+		}
+	})
 }
