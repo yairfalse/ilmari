@@ -3296,7 +3296,16 @@ func (c *Context) Rollback(resource string) (err error) {
 	var revisions []rsWithRevision
 	for _, rs := range rsList.Items {
 		revStr := rs.Annotations["deployment.kubernetes.io/revision"]
-		rev, _ := strconv.ParseInt(revStr, 10, 64)
+		rev, err := strconv.ParseInt(revStr, 10, 64)
+		if err != nil {
+			msg := fmt.Sprintf("Warning: ReplicaSet %q in namespace %q has invalid or missing revision annotation: %q (error: %v); skipping", rs.Name, rs.Namespace, revStr, err)
+			if c.t != nil {
+				c.t.Log(msg)
+			} else {
+				fmt.Println(msg)
+			}
+			continue
+		}
 		revisions = append(revisions, rsWithRevision{rs: rs, revision: rev})
 	}
 	sort.Slice(revisions, func(i, j int) bool {
