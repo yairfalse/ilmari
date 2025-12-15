@@ -37,6 +37,7 @@ import (
 	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
@@ -395,6 +396,7 @@ func init() {
 	_ = corev1.AddToScheme(scheme)
 	_ = appsv1.AddToScheme(scheme)
 	_ = networkingv1.AddToScheme(scheme)
+	_ = rbacv1.AddToScheme(scheme)
 }
 
 // toUnstructured converts a typed object to unstructured.
@@ -3855,4 +3857,677 @@ func (t *Traffic) P99Latency() time.Duration {
 		idx = len(latenciesCopy) - 1
 	}
 	return latenciesCopy[idx]
+}
+
+// ============================================================================
+// Log Aggregation
+// ============================================================================
+
+// LogsOptions configures log retrieval.
+type LogsOptions struct {
+	// Container specifies which container to get logs from (for multi-container pods)
+	Container string
+	// Since returns logs newer than this duration
+	Since time.Duration
+	// TailLines limits output to the last N lines
+	TailLines int64
+}
+
+// LogsAll retrieves logs from all pods matching the label selector.
+// Returns a map of pod name to logs.
+// Selector format: "key=value" or "key1=value1,key2=value2"
+func (c *Context) LogsAll(selector string) (map[string]string, error) {
+	return c.LogsAllWithOptions(selector, LogsOptions{})
+}
+
+// LogsAllWithOptions retrieves logs from all pods matching the selector with options.
+func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (result map[string]string, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.LogsAll",
+		attribute.String("selector", selector))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// List pods matching selector
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	result = make(map[string]string)
+
+	for _, pod := range pods.Items {
+		logOpts := &corev1.PodLogOptions{}
+		if opts.Container != "" {
+			logOpts.Container = opts.Container
+		}
+		if opts.Since > 0 {
+			sinceSeconds := int64(opts.Since.Seconds())
+			logOpts.SinceSeconds = &sinceSeconds
+		}
+		if opts.TailLines > 0 {
+			logOpts.TailLines = &opts.TailLines
+		}
+
+		req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod.Name, logOpts)
+		stream, streamErr := req.Stream(context.Background())
+		if streamErr != nil {
+			// Store error message instead of failing entirely
+			result[pod.Name] = fmt.Sprintf("[error: %v]", streamErr)
+			continue
+		}
+
+		buf := new(strings.Builder)
+		_, copyErr := io.Copy(buf, stream)
+		stream.Close()
+		if copyErr != nil {
+			result[pod.Name] = fmt.Sprintf("[error reading: %v]", copyErr)
+			continue
+		}
+
+		result[pod.Name] = buf.String()
+	}
+
+	return result, nil
+}
+
+// ============================================================================
+// Secret Helpers
+// ============================================================================
+
+// SecretFromFile creates a Secret from file contents.
+// The files map keys become the secret data keys, values are file paths.
+func (c *Context) SecretFromFile(name string, files map[string]string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.SecretFromFile",
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	data := make(map[string][]byte)
+	for key, path := range files {
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return fmt.Errorf("failed to read file %s: %w", path, readErr)
+		}
+		data[key] = content
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Data: data,
+	}
+
+	return c.Apply(secret)
+}
+
+// SecretFromEnv creates a Secret from environment variables.
+// Each key is looked up in the current process environment.
+func (c *Context) SecretFromEnv(name string, keys ...string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.SecretFromEnv",
+		attribute.String("name", name),
+		attribute.Int("key_count", len(keys)))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	data := make(map[string][]byte)
+	for _, key := range keys {
+		value := os.Getenv(key)
+		if value == "" {
+			return fmt.Errorf("environment variable %s is not set or empty", key)
+		}
+		data[key] = []byte(value)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Data: data,
+	}
+
+	return c.Apply(secret)
+}
+
+// SecretTLS creates a TLS Secret from certificate and key files.
+func (c *Context) SecretTLS(name, certPath, keyPath string) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.SecretTLS",
+		attribute.String("name", name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	certData, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("failed to read certificate: %w", err)
+	}
+
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("failed to read key: %w", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certData,
+			corev1.TLSPrivateKeyKey: keyData,
+		},
+	}
+
+	return c.Apply(secret)
+}
+
+// ============================================================================
+// PVC Helpers
+// ============================================================================
+
+// WaitPVCBound waits for a PVC to be bound.
+// Resource format: "pvc/name" or just "name"
+func (c *Context) WaitPVCBound(resource string) error {
+	return c.WaitPVCBoundTimeout(resource, 60*time.Second)
+}
+
+// WaitPVCBoundTimeout waits for a PVC to be bound with custom timeout.
+func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.WaitPVCBound",
+		attribute.String("resource", resource),
+		attribute.Int64("timeout_ms", timeout.Milliseconds()))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	// Extract name (remove pvc/ prefix if present)
+	name := resource
+	if strings.HasPrefix(resource, "pvc/") {
+		name = strings.TrimPrefix(resource, "pvc/")
+	} else if strings.HasPrefix(resource, "persistentvolumeclaim/") {
+		name = strings.TrimPrefix(resource, "persistentvolumeclaim/")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		pvc, getErr := c.Client.CoreV1().PersistentVolumeClaims(c.Namespace).Get(
+			context.Background(), name, metav1.GetOptions{})
+		if getErr != nil {
+			if !apierrors.IsNotFound(getErr) {
+				return getErr
+			}
+		} else if pvc.Status.Phase == corev1.ClaimBound {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for PVC %s to be bound", name)
+		case <-ticker.C:
+		}
+	}
+}
+
+// IsBound asserts the PVC is bound.
+func (a *Assertion) IsBound() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pvc" && kind != "persistentvolumeclaim" {
+		a.err = fmt.Errorf("IsBound only works with PVCs, got %s", kind)
+		return a
+	}
+
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	if pvc.Status.Phase != corev1.ClaimBound {
+		a.err = fmt.Errorf("PVC %s is not bound (phase: %s)", name, pvc.Status.Phase)
+	}
+	return a
+}
+
+// HasStorageClass asserts the PVC has the specified storage class.
+func (a *Assertion) HasStorageClass(class string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pvc" && kind != "persistentvolumeclaim" {
+		a.err = fmt.Errorf("HasStorageClass only works with PVCs, got %s", kind)
+		return a
+	}
+
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != class {
+		actual := "<nil>"
+		if pvc.Spec.StorageClassName != nil {
+			actual = *pvc.Spec.StorageClassName
+		}
+		a.err = fmt.Errorf("expected storage class %s, got %s", class, actual)
+	}
+	return a
+}
+
+// HasCapacity asserts the PVC has at least the specified capacity.
+func (a *Assertion) HasCapacity(capacity string) *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	parts := strings.SplitN(a.resource, "/", 2)
+	if len(parts) != 2 {
+		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+		return a
+	}
+
+	kind := strings.ToLower(parts[0])
+	name := parts[1]
+
+	if kind != "pvc" && kind != "persistentvolumeclaim" {
+		a.err = fmt.Errorf("HasCapacity only works with PVCs, got %s", kind)
+		return a
+	}
+
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	expected := resource.MustParse(capacity)
+	actual := pvc.Status.Capacity[corev1.ResourceStorage]
+
+	if actual.Cmp(expected) < 0 {
+		a.err = fmt.Errorf("expected capacity >= %s, got %s", capacity, actual.String())
+	}
+	return a
+}
+
+// ============================================================================
+// RBAC Builder
+// ============================================================================
+
+// RBACBundle contains a ServiceAccount, Role, and RoleBinding.
+type RBACBundle struct {
+	ServiceAccount *corev1.ServiceAccount
+	Role           *rbacv1.Role
+	RoleBinding    *rbacv1.RoleBinding
+}
+
+// RBACBuilder provides a fluent API for building RBAC resources.
+type RBACBuilder struct {
+	name     string
+	roleName string
+	rules    []rbacv1.PolicyRule
+}
+
+// ServiceAccount creates a new RBACBuilder with the given name.
+func ServiceAccount(name string) *RBACBuilder {
+	return &RBACBuilder{
+		name:     name,
+		roleName: name + "-role",
+		rules:    make([]rbacv1.PolicyRule, 0),
+	}
+}
+
+// WithRole sets a custom role name.
+func (r *RBACBuilder) WithRole(roleName string) *RBACBuilder {
+	r.roleName = roleName
+	return r
+}
+
+// CanGet adds get permission for the specified resources.
+func (r *RBACBuilder) CanGet(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"get"},
+	})
+	return r
+}
+
+// CanList adds list permission for the specified resources.
+func (r *RBACBuilder) CanList(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"list"},
+	})
+	return r
+}
+
+// CanWatch adds watch permission for the specified resources.
+func (r *RBACBuilder) CanWatch(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"watch"},
+	})
+	return r
+}
+
+// CanCreate adds create permission for the specified resources.
+func (r *RBACBuilder) CanCreate(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"create"},
+	})
+	return r
+}
+
+// CanUpdate adds update permission for the specified resources.
+func (r *RBACBuilder) CanUpdate(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"update"},
+	})
+	return r
+}
+
+// CanDelete adds delete permission for the specified resources.
+func (r *RBACBuilder) CanDelete(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"delete"},
+	})
+	return r
+}
+
+// Can adds custom verbs for the specified resources.
+func (r *RBACBuilder) Can(verbs []string, resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     verbs,
+	})
+	return r
+}
+
+// CanAll adds all permissions (get, list, watch, create, update, delete) for resources.
+func (r *RBACBuilder) CanAll(resources ...string) *RBACBuilder {
+	r.rules = append(r.rules, rbacv1.PolicyRule{
+		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		Resources: resources,
+		Verbs:     []string{"get", "list", "watch", "create", "update", "delete"},
+	})
+	return r
+}
+
+// Build creates the RBACBundle with ServiceAccount, Role, and RoleBinding.
+func (r *RBACBuilder) Build() *RBACBundle {
+	return &RBACBundle{
+		ServiceAccount: &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: r.name,
+			},
+		},
+		Role: &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: r.roleName,
+			},
+			Rules: r.rules,
+		},
+		RoleBinding: &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: r.name + "-binding",
+			},
+			Subjects: []rbacv1.Subject{
+				{
+					Kind: "ServiceAccount",
+					Name: r.name,
+				},
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "Role",
+				Name:     r.roleName,
+			},
+		},
+	}
+}
+
+// ApplyRBAC applies all resources in the RBACBundle.
+func (c *Context) ApplyRBAC(bundle *RBACBundle) (err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.ApplyRBAC",
+		attribute.String("serviceaccount", bundle.ServiceAccount.Name))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	if err = c.Apply(bundle.ServiceAccount); err != nil {
+		return fmt.Errorf("failed to apply ServiceAccount: %w", err)
+	}
+	if err = c.Apply(bundle.Role); err != nil {
+		return fmt.Errorf("failed to apply Role: %w", err)
+	}
+	if err = c.Apply(bundle.RoleBinding); err != nil {
+		return fmt.Errorf("failed to apply RoleBinding: %w", err)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Ingress Testing
+// ============================================================================
+
+// IngressTest provides fluent testing for Ingress resources.
+type IngressTest struct {
+	ctx  *Context
+	name string
+	host string
+	path string
+	err  error
+}
+
+// TestIngress creates an IngressTest for the given ingress name.
+func (c *Context) TestIngress(name string) *IngressTest {
+	return &IngressTest{
+		ctx:  c,
+		name: name,
+	}
+}
+
+// Host sets the host to test.
+func (i *IngressTest) Host(host string) *IngressTest {
+	if i.err != nil {
+		return i
+	}
+	i.host = host
+	return i
+}
+
+// Path sets the path to test.
+func (i *IngressTest) Path(path string) *IngressTest {
+	if i.err != nil {
+		return i
+	}
+	i.path = path
+	return i
+}
+
+// ExpectBackend asserts the ingress routes to the expected backend.
+// Backend format: "svc/name" or just "name"
+func (i *IngressTest) ExpectBackend(backend string, port int) *IngressTest {
+	if i.err != nil {
+		return i
+	}
+
+	// Get ingress
+	ing, err := i.ctx.Client.NetworkingV1().Ingresses(i.ctx.Namespace).Get(
+		context.Background(), i.name, metav1.GetOptions{})
+	if err != nil {
+		i.err = fmt.Errorf("failed to get ingress %s: %w", i.name, err)
+		return i
+	}
+
+	// Parse expected backend
+	expectedSvc := backend
+	if strings.HasPrefix(backend, "svc/") {
+		expectedSvc = strings.TrimPrefix(backend, "svc/")
+	}
+
+	// Find matching rule
+	found := false
+	for _, rule := range ing.Spec.Rules {
+		// Check host match (empty host in test means match any)
+		if i.host != "" && rule.Host != i.host {
+			continue
+		}
+
+		if rule.HTTP == nil {
+			continue
+		}
+
+		for _, p := range rule.HTTP.Paths {
+			// Check path match (empty path in test means match any)
+			pathMatches := i.path == "" || p.Path == i.path || strings.HasPrefix(p.Path, i.path)
+
+			if pathMatches {
+				if p.Backend.Service != nil {
+					actualSvc := p.Backend.Service.Name
+					actualPort := 0
+					if p.Backend.Service.Port.Number != 0 {
+						actualPort = int(p.Backend.Service.Port.Number)
+					}
+
+					if actualSvc == expectedSvc && actualPort == port {
+						found = true
+						break
+					}
+				}
+			}
+		}
+		if found {
+			break
+		}
+	}
+
+	if !found {
+		i.err = fmt.Errorf("ingress %s does not route host=%q path=%q to %s:%d",
+			i.name, i.host, i.path, expectedSvc, port)
+	}
+
+	return i
+}
+
+// ExpectTLS asserts the ingress has TLS configured for the host.
+func (i *IngressTest) ExpectTLS(secretName string) *IngressTest {
+	if i.err != nil {
+		return i
+	}
+
+	ing, err := i.ctx.Client.NetworkingV1().Ingresses(i.ctx.Namespace).Get(
+		context.Background(), i.name, metav1.GetOptions{})
+	if err != nil {
+		i.err = fmt.Errorf("failed to get ingress %s: %w", i.name, err)
+		return i
+	}
+
+	found := false
+	for _, tls := range ing.Spec.TLS {
+		if tls.SecretName == secretName {
+			// Check if host matches (if specified)
+			if i.host == "" {
+				found = true
+				break
+			}
+			for _, host := range tls.Hosts {
+				if host == i.host {
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			break
+		}
+	}
+
+	if !found {
+		i.err = fmt.Errorf("ingress %s does not have TLS secret %s for host %q",
+			i.name, secretName, i.host)
+	}
+
+	return i
+}
+
+// Error returns any error from the test chain.
+func (i *IngressTest) Error() error {
+	return i.err
+}
+
+// Must panics if there was an error in the test chain.
+func (i *IngressTest) Must() {
+	if i.err != nil {
+		panic(fmt.Sprintf("IngressTest failed: %v", i.err))
+	}
 }

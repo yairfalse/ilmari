@@ -3,6 +3,7 @@ package ilmari
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -2581,6 +2583,481 @@ func TestPortForwardGetVerify(t *testing.T) {
 
 		if resp.StatusCode != 200 {
 			t.Errorf("expected 200, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// ============================================================================
+// Log Aggregation Tests
+// ============================================================================
+
+// TestLogsAllRetrievesFromMultiplePods verifies LogsAll works with multiple pods.
+func TestLogsAllRetrievesFromMultiplePods(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create 2 pods with the same label
+		for i := 1; i <= 2; i++ {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   fmt.Sprintf("logs-all-test-%d", i),
+					Labels: map[string]string{"app": "logs-all-test"},
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "echo",
+							Image:   "busybox:1.36",
+							Command: []string{"sh", "-c", fmt.Sprintf("echo 'hello from pod %d' && sleep 60", i)},
+						},
+					},
+				},
+			}
+			if err := ctx.Apply(pod); err != nil {
+				t.Fatalf("Apply pod %d failed: %v", i, err)
+			}
+		}
+
+		// Wait for both pods
+		for i := 1; i <= 2; i++ {
+			if err := ctx.WaitReady(fmt.Sprintf("pod/logs-all-test-%d", i)); err != nil {
+				t.Fatalf("WaitReady pod %d failed: %v", i, err)
+			}
+		}
+
+		// Wait for logs
+		time.Sleep(2 * time.Second)
+
+		// Get all logs
+		logs, err := ctx.LogsAll("app=logs-all-test")
+		if err != nil {
+			t.Fatalf("LogsAll failed: %v", err)
+		}
+
+		if len(logs) != 2 {
+			t.Errorf("expected logs from 2 pods, got %d", len(logs))
+		}
+
+		// Verify each pod has logs
+		for name, log := range logs {
+			if !strings.Contains(log, "hello from pod") {
+				t.Errorf("pod %s logs missing expected content: %s", name, log)
+			}
+		}
+	})
+}
+
+// TestLogsAllWithOptions verifies LogsAllWithOptions works with tail lines.
+func TestLogsAllWithOptions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "logs-opts-test",
+				Labels: map[string]string{"app": "logs-opts"},
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "for i in 1 2 3 4 5; do echo line$i; done; sleep 60"},
+					},
+				},
+			},
+		}
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+		if err := ctx.WaitReady("pod/logs-opts-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		time.Sleep(2 * time.Second)
+
+		// Get only last 2 lines
+		logs, err := ctx.LogsAllWithOptions("app=logs-opts", LogsOptions{
+			TailLines: 2,
+		})
+		if err != nil {
+			t.Fatalf("LogsAllWithOptions failed: %v", err)
+		}
+
+		log := logs["logs-opts-test"]
+		lines := strings.Split(strings.TrimSpace(log), "\n")
+		if len(lines) > 2 {
+			t.Errorf("expected at most 2 lines, got %d", len(lines))
+		}
+	})
+}
+
+// ============================================================================
+// Secret Helpers Tests
+// ============================================================================
+
+// TestSecretFromFile verifies SecretFromFile creates a secret from files.
+func TestSecretFromFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create temp files
+		tmpDir := t.TempDir()
+		file1 := filepath.Join(tmpDir, "config.txt")
+		file2 := filepath.Join(tmpDir, "data.txt")
+
+		os.WriteFile(file1, []byte("config-content"), 0644)
+		os.WriteFile(file2, []byte("data-content"), 0644)
+
+		// Create secret from files
+		err := ctx.SecretFromFile("file-secret", map[string]string{
+			"config": file1,
+			"data":   file2,
+		})
+		if err != nil {
+			t.Fatalf("SecretFromFile failed: %v", err)
+		}
+
+		// Verify secret was created
+		secret, err := ctx.Client.CoreV1().Secrets(ctx.Namespace).Get(
+			context.Background(), "file-secret", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get secret failed: %v", err)
+		}
+
+		if string(secret.Data["config"]) != "config-content" {
+			t.Errorf("expected config=config-content, got %s", secret.Data["config"])
+		}
+		if string(secret.Data["data"]) != "data-content" {
+			t.Errorf("expected data=data-content, got %s", secret.Data["data"])
+		}
+	})
+}
+
+// TestSecretFromEnv verifies SecretFromEnv creates a secret from env vars.
+func TestSecretFromEnv(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Set env vars
+		os.Setenv("TEST_SECRET_USER", "admin")
+		os.Setenv("TEST_SECRET_PASS", "secret123")
+		defer os.Unsetenv("TEST_SECRET_USER")
+		defer os.Unsetenv("TEST_SECRET_PASS")
+
+		// Create secret from env
+		err := ctx.SecretFromEnv("env-secret", "TEST_SECRET_USER", "TEST_SECRET_PASS")
+		if err != nil {
+			t.Fatalf("SecretFromEnv failed: %v", err)
+		}
+
+		// Verify secret was created
+		secret, err := ctx.Client.CoreV1().Secrets(ctx.Namespace).Get(
+			context.Background(), "env-secret", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get secret failed: %v", err)
+		}
+
+		if string(secret.Data["TEST_SECRET_USER"]) != "admin" {
+			t.Errorf("expected TEST_SECRET_USER=admin, got %s", secret.Data["TEST_SECRET_USER"])
+		}
+		if string(secret.Data["TEST_SECRET_PASS"]) != "secret123" {
+			t.Errorf("expected TEST_SECRET_PASS=secret123, got %s", secret.Data["TEST_SECRET_PASS"])
+		}
+	})
+}
+
+// TestSecretTLS verifies SecretTLS creates a TLS secret.
+func TestSecretTLS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create dummy cert/key files (not real certs, just for testing)
+		tmpDir := t.TempDir()
+		certPath := filepath.Join(tmpDir, "tls.crt")
+		keyPath := filepath.Join(tmpDir, "tls.key")
+
+		os.WriteFile(certPath, []byte("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"), 0644)
+		os.WriteFile(keyPath, []byte("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"), 0644)
+
+		// Create TLS secret
+		err := ctx.SecretTLS("tls-secret", certPath, keyPath)
+		if err != nil {
+			t.Fatalf("SecretTLS failed: %v", err)
+		}
+
+		// Verify secret was created with TLS type
+		secret, err := ctx.Client.CoreV1().Secrets(ctx.Namespace).Get(
+			context.Background(), "tls-secret", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get secret failed: %v", err)
+		}
+
+		if secret.Type != corev1.SecretTypeTLS {
+			t.Errorf("expected type kubernetes.io/tls, got %s", secret.Type)
+		}
+		if len(secret.Data["tls.crt"]) == 0 {
+			t.Error("tls.crt should not be empty")
+		}
+		if len(secret.Data["tls.key"]) == 0 {
+			t.Error("tls.key should not be empty")
+		}
+	})
+}
+
+// ============================================================================
+// RBAC Builder Tests
+// ============================================================================
+
+// TestRBACBuilder verifies ServiceAccount fluent builder.
+func TestRBACBuilder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Build RBAC bundle
+		bundle := ServiceAccount("myapp").
+			WithRole("myapp-reader").
+			CanGet("pods", "services").
+			CanList("configmaps").
+			Build()
+
+		// Verify bundle structure
+		if bundle.ServiceAccount.Name != "myapp" {
+			t.Errorf("expected SA name myapp, got %s", bundle.ServiceAccount.Name)
+		}
+		if bundle.Role.Name != "myapp-reader" {
+			t.Errorf("expected Role name myapp-reader, got %s", bundle.Role.Name)
+		}
+		if bundle.RoleBinding.Name != "myapp-binding" {
+			t.Errorf("expected RoleBinding name myapp-binding, got %s", bundle.RoleBinding.Name)
+		}
+
+		// Apply the bundle
+		if err := ctx.ApplyRBAC(bundle); err != nil {
+			t.Fatalf("ApplyRBAC failed: %v", err)
+		}
+
+		// Verify ServiceAccount exists
+		_, err := ctx.Client.CoreV1().ServiceAccounts(ctx.Namespace).Get(
+			context.Background(), "myapp", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get ServiceAccount failed: %v", err)
+		}
+
+		// Verify Role exists
+		role, err := ctx.Client.RbacV1().Roles(ctx.Namespace).Get(
+			context.Background(), "myapp-reader", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get Role failed: %v", err)
+		}
+		if len(role.Rules) != 2 {
+			t.Errorf("expected 2 rules, got %d", len(role.Rules))
+		}
+
+		// Verify RoleBinding exists
+		_, err = ctx.Client.RbacV1().RoleBindings(ctx.Namespace).Get(
+			context.Background(), "myapp-binding", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get RoleBinding failed: %v", err)
+		}
+	})
+}
+
+// TestRBACBuilderCanAll verifies CanAll adds all permissions.
+func TestRBACBuilderCanAll(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		bundle := ServiceAccount("admin-sa").
+			CanAll("pods", "deployments").
+			Build()
+
+		if err := ctx.ApplyRBAC(bundle); err != nil {
+			t.Fatalf("ApplyRBAC failed: %v", err)
+		}
+
+		// Verify Role has all verbs
+		role, err := ctx.Client.RbacV1().Roles(ctx.Namespace).Get(
+			context.Background(), "admin-sa-role", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Get Role failed: %v", err)
+		}
+
+		if len(role.Rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(role.Rules))
+		}
+
+		verbs := role.Rules[0].Verbs
+		expectedVerbs := []string{"get", "list", "watch", "create", "update", "delete"}
+		if len(verbs) != len(expectedVerbs) {
+			t.Errorf("expected %d verbs, got %d", len(expectedVerbs), len(verbs))
+		}
+	})
+}
+
+// ============================================================================
+// Ingress Testing Tests
+// ============================================================================
+
+// TestIngressTestExpectBackend verifies TestIngress works.
+func TestIngressTestExpectBackend(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create an ingress
+		pathType := networkingv1.PathTypePrefix
+		ing := &networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-ingress",
+			},
+			Spec: networkingv1.IngressSpec{
+				Rules: []networkingv1.IngressRule{
+					{
+						Host: "api.example.com",
+						IngressRuleValue: networkingv1.IngressRuleValue{
+							HTTP: &networkingv1.HTTPIngressRuleValue{
+								Paths: []networkingv1.HTTPIngressPath{
+									{
+										Path:     "/",
+										PathType: &pathType,
+										Backend: networkingv1.IngressBackend{
+											Service: &networkingv1.IngressServiceBackend{
+												Name: "api-svc",
+												Port: networkingv1.ServiceBackendPort{
+													Number: 8080,
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		_, err := ctx.Client.NetworkingV1().Ingresses(ctx.Namespace).Create(
+			context.Background(), ing, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Create ingress failed: %v", err)
+		}
+
+		// Test should pass
+		err = ctx.TestIngress("test-ingress").
+			Host("api.example.com").
+			ExpectBackend("api-svc", 8080).
+			Error()
+		if err != nil {
+			t.Errorf("TestIngress should pass: %v", err)
+		}
+
+		// Test should fail with wrong backend
+		err = ctx.TestIngress("test-ingress").
+			Host("api.example.com").
+			ExpectBackend("wrong-svc", 8080).
+			Error()
+		if err == nil {
+			t.Error("TestIngress should fail for wrong backend")
+		}
+
+		// Test should fail with wrong host
+		err = ctx.TestIngress("test-ingress").
+			Host("wrong.example.com").
+			ExpectBackend("api-svc", 8080).
+			Error()
+		if err == nil {
+			t.Error("TestIngress should fail for wrong host")
+		}
+	})
+}
+
+// TestIngressTestExpectTLS verifies TLS assertion works.
+func TestIngressTestExpectTLS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create an ingress with TLS
+		pathType := networkingv1.PathTypePrefix
+		ing := &networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "tls-ingress",
+			},
+			Spec: networkingv1.IngressSpec{
+				TLS: []networkingv1.IngressTLS{
+					{
+						Hosts:      []string{"secure.example.com"},
+						SecretName: "tls-cert",
+					},
+				},
+				Rules: []networkingv1.IngressRule{
+					{
+						Host: "secure.example.com",
+						IngressRuleValue: networkingv1.IngressRuleValue{
+							HTTP: &networkingv1.HTTPIngressRuleValue{
+								Paths: []networkingv1.HTTPIngressPath{
+									{
+										Path:     "/",
+										PathType: &pathType,
+										Backend: networkingv1.IngressBackend{
+											Service: &networkingv1.IngressServiceBackend{
+												Name: "secure-svc",
+												Port: networkingv1.ServiceBackendPort{
+													Number: 443,
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		_, err := ctx.Client.NetworkingV1().Ingresses(ctx.Namespace).Create(
+			context.Background(), ing, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Create ingress failed: %v", err)
+		}
+
+		// Test TLS should pass
+		err = ctx.TestIngress("tls-ingress").
+			Host("secure.example.com").
+			ExpectTLS("tls-cert").
+			Error()
+		if err != nil {
+			t.Errorf("TestIngress TLS should pass: %v", err)
+		}
+
+		// Test TLS should fail with wrong secret
+		err = ctx.TestIngress("tls-ingress").
+			Host("secure.example.com").
+			ExpectTLS("wrong-cert").
+			Error()
+		if err == nil {
+			t.Error("TestIngress TLS should fail for wrong secret")
 		}
 	})
 }
