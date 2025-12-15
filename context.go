@@ -1665,8 +1665,58 @@ func (pf *PortForward) Get(path string) (*http.Response, error) {
 	if pf.err != nil {
 		return nil, pf.err
 	}
-	url := fmt.Sprintf("http://localhost:%d%s", pf.localPort, path)
-	return pf.httpClient.Get(url)
+	return pf.httpClient.Get(pf.URL(path))
+}
+
+// URL returns the full URL for a given path through the port forward.
+func (pf *PortForward) URL(path string) string {
+	return fmt.Sprintf("http://localhost:%d%s", pf.localPort, path)
+}
+
+// Post makes an HTTP POST request through the port forward.
+// Caller is responsible for closing the response body.
+func (pf *PortForward) Post(path, contentType string, body io.Reader) (*http.Response, error) {
+	if pf.err != nil {
+		return nil, pf.err
+	}
+	return pf.httpClient.Post(pf.URL(path), contentType, body)
+}
+
+// Put makes an HTTP PUT request through the port forward.
+// Caller is responsible for closing the response body.
+func (pf *PortForward) Put(path, contentType string, body io.Reader) (*http.Response, error) {
+	if pf.err != nil {
+		return nil, pf.err
+	}
+	req, err := http.NewRequest(http.MethodPut, pf.URL(path), body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	return pf.httpClient.Do(req)
+}
+
+// Delete makes an HTTP DELETE request through the port forward.
+// Caller is responsible for closing the response body.
+func (pf *PortForward) Delete(path string) (*http.Response, error) {
+	if pf.err != nil {
+		return nil, pf.err
+	}
+	req, err := http.NewRequest(http.MethodDelete, pf.URL(path), nil)
+	if err != nil {
+		return nil, err
+	}
+	return pf.httpClient.Do(req)
+}
+
+// Do executes a custom HTTP request through the port forward.
+// Use this for PATCH, OPTIONS, or requests with custom headers.
+// Caller is responsible for closing the response body.
+func (pf *PortForward) Do(req *http.Request) (*http.Response, error) {
+	if pf.err != nil {
+		return nil, pf.err
+	}
+	return pf.httpClient.Do(req)
 }
 
 // Forward creates a port forward to a pod or service.
