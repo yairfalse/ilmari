@@ -4081,7 +4081,7 @@ func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) (e
 
 	for {
 		pvc, getErr := c.Client.CoreV1().PersistentVolumeClaims(c.Namespace).Get(
-			context.Background(), name, metav1.GetOptions{})
+			ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			if !apierrors.IsNotFound(getErr) {
 				return getErr
