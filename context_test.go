@@ -2800,8 +2800,12 @@ func TestSecretTLS(t *testing.T) {
 		certPath := filepath.Join(tmpDir, "tls.crt")
 		keyPath := filepath.Join(tmpDir, "tls.key")
 
-		os.WriteFile(certPath, []byte("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"), 0644)
-		os.WriteFile(keyPath, []byte("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"), 0644)
+		if err := os.WriteFile(certPath, []byte("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"), 0644); err != nil {
+			t.Fatalf("failed to write cert file: %v", err)
+		}
+		if err := os.WriteFile(keyPath, []byte("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"), 0644); err != nil {
+			t.Fatalf("failed to write key file: %v", err)
+		}
 
 		// Create TLS secret
 		err := ctx.SecretTLS("tls-secret", certPath, keyPath)
