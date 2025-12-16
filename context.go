@@ -4449,7 +4449,7 @@ func (i *IngressTest) ExpectBackend(backend string, port int) *IngressTest {
 
 		for _, p := range rule.HTTP.Paths {
 			// Check path match (empty path in test means match any)
-			pathMatches := i.path == "" || p.Path == i.path || strings.HasPrefix(p.Path, i.path)
+			pathMatches := i.path == "" || p.Path == i.path || strings.HasPrefix(i.path, p.Path)
 
 			if pathMatches {
 				if p.Backend.Service != nil {
