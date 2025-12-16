@@ -2725,8 +2725,12 @@ func TestSecretFromFile(t *testing.T) {
 		file1 := filepath.Join(tmpDir, "config.txt")
 		file2 := filepath.Join(tmpDir, "data.txt")
 
-		os.WriteFile(file1, []byte("config-content"), 0644)
-		os.WriteFile(file2, []byte("data-content"), 0644)
+		if err := os.WriteFile(file1, []byte("config-content"), 0644); err != nil {
+			t.Fatalf("failed to write file1: %v", err)
+		}
+		if err := os.WriteFile(file2, []byte("data-content"), 0644); err != nil {
+			t.Fatalf("failed to write file2: %v", err)
+		}
 
 		// Create secret from files
 		err := ctx.SecretFromFile("file-secret", map[string]string{
