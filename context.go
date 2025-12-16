@@ -3881,6 +3881,12 @@ func (c *Context) LogsAll(selector string) (map[string]string, error) {
 }
 
 // LogsAllWithOptions retrieves logs from all pods matching the selector with options.
+// Returns a map of pod name to log contents.
+//
+// Error handling: Individual pod errors are stored in the result map as "[error: ...]"
+// rather than failing the entire operation. This allows collecting logs from healthy pods
+// even when some pods are failing. The function only returns an error for selector/listing
+// failures. Check individual values for "[error" prefix to detect per-pod failures.
 func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (result map[string]string, err error) {
 	_, span := c.startSpan(context.Background(), "ilmari.LogsAll",
 		attribute.String("selector", selector))
@@ -4098,35 +4104,45 @@ func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) (e
 	}
 }
 
-// IsBound asserts the PVC is bound.
-func (a *Assertion) IsBound() *Assertion {
-	if a.err != nil {
-		return a
-	}
-
+// getPVC is a helper that parses the resource string and fetches the PVC.
+// Returns nil and sets a.err if the resource is invalid or not a PVC.
+func (a *Assertion) getPVC(methodName string) *corev1.PersistentVolumeClaim {
 	parts := strings.SplitN(a.resource, "/", 2)
 	if len(parts) != 2 {
 		a.err = fmt.Errorf("invalid resource format %q", a.resource)
-		return a
+		return nil
 	}
 
 	kind := strings.ToLower(parts[0])
 	name := parts[1]
 
 	if kind != "pvc" && kind != "persistentvolumeclaim" {
-		a.err = fmt.Errorf("IsBound only works with PVCs, got %s", kind)
-		return a
+		a.err = fmt.Errorf("%s only works with PVCs, got %s", methodName, kind)
+		return nil
 	}
 
 	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
 		context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		a.err = err
+		return nil
+	}
+	return pvc
+}
+
+// IsBound asserts the PVC is bound.
+func (a *Assertion) IsBound() *Assertion {
+	if a.err != nil {
+		return a
+	}
+
+	pvc := a.getPVC("IsBound")
+	if pvc == nil {
 		return a
 	}
 
 	if pvc.Status.Phase != corev1.ClaimBound {
-		a.err = fmt.Errorf("PVC %s is not bound (phase: %s)", name, pvc.Status.Phase)
+		a.err = fmt.Errorf("PVC %s is not bound (phase: %s)", pvc.Name, pvc.Status.Phase)
 	}
 	return a
 }
@@ -4137,24 +4153,8 @@ func (a *Assertion) HasStorageClass(class string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
-		return a
-	}
-
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-
-	if kind != "pvc" && kind != "persistentvolumeclaim" {
-		a.err = fmt.Errorf("HasStorageClass only works with PVCs, got %s", kind)
-		return a
-	}
-
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), name, metav1.GetOptions{})
-	if err != nil {
-		a.err = err
+	pvc := a.getPVC("HasStorageClass")
+	if pvc == nil {
 		return a
 	}
 
@@ -4174,24 +4174,8 @@ func (a *Assertion) HasCapacity(capacity string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
-		return a
-	}
-
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-
-	if kind != "pvc" && kind != "persistentvolumeclaim" {
-		a.err = fmt.Errorf("HasCapacity only works with PVCs, got %s", kind)
-		return a
-	}
-
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), name, metav1.GetOptions{})
-	if err != nil {
-		a.err = err
+	pvc := a.getPVC("HasCapacity")
+	if pvc == nil {
 		return a
 	}
 
@@ -4237,82 +4221,113 @@ func (r *RBACBuilder) WithRole(roleName string) *RBACBuilder {
 	return r
 }
 
+// apiGroupForResource returns the correct API group for a resource.
+// Returns "" for core resources, or the appropriate group for others.
+func apiGroupForResource(resource string) string {
+	switch resource {
+	// Core API group ("")
+	case "pods", "services", "configmaps", "secrets", "persistentvolumeclaims",
+		"serviceaccounts", "namespaces", "nodes", "events", "endpoints",
+		"persistentvolumes", "replicationcontrollers", "resourcequotas", "limitranges":
+		return ""
+	// apps group
+	case "deployments", "statefulsets", "daemonsets", "replicasets", "controllerrevisions":
+		return "apps"
+	// batch group
+	case "jobs", "cronjobs":
+		return "batch"
+	// networking.k8s.io group
+	case "ingresses", "networkpolicies", "ingressclasses":
+		return "networking.k8s.io"
+	// rbac.authorization.k8s.io group
+	case "roles", "rolebindings", "clusterroles", "clusterrolebindings":
+		return "rbac.authorization.k8s.io"
+	// autoscaling group
+	case "horizontalpodautoscalers":
+		return "autoscaling"
+	// policy group
+	case "poddisruptionbudgets":
+		return "policy"
+	default:
+		// Default to core for unknown resources
+		return ""
+	}
+}
+
+// addRule adds a policy rule with the correct API group for each resource.
+func (r *RBACBuilder) addRule(verbs []string, resources ...string) {
+	// Group resources by their API group
+	byGroup := make(map[string][]string)
+	for _, res := range resources {
+		group := apiGroupForResource(res)
+		byGroup[group] = append(byGroup[group], res)
+	}
+
+	// Create separate rules for each API group
+	for group, groupResources := range byGroup {
+		r.rules = append(r.rules, rbacv1.PolicyRule{
+			APIGroups: []string{group},
+			Resources: groupResources,
+			Verbs:     verbs,
+		})
+	}
+}
+
 // CanGet adds get permission for the specified resources.
 func (r *RBACBuilder) CanGet(resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     []string{"get"},
-	})
+	r.addRule([]string{"get"}, resources...)
 	return r
 }
 
 // CanList adds list permission for the specified resources.
 func (r *RBACBuilder) CanList(resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     []string{"list"},
-	})
+	r.addRule([]string{"list"}, resources...)
 	return r
 }
 
 // CanWatch adds watch permission for the specified resources.
 func (r *RBACBuilder) CanWatch(resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     []string{"watch"},
-	})
+	r.addRule([]string{"watch"}, resources...)
 	return r
 }
 
 // CanCreate adds create permission for the specified resources.
 func (r *RBACBuilder) CanCreate(resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     []string{"create"},
-	})
+	r.addRule([]string{"create"}, resources...)
 	return r
 }
 
 // CanUpdate adds update permission for the specified resources.
 func (r *RBACBuilder) CanUpdate(resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     []string{"update"},
-	})
+	r.addRule([]string{"update"}, resources...)
 	return r
 }
 
 // CanDelete adds delete permission for the specified resources.
 func (r *RBACBuilder) CanDelete(resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     []string{"delete"},
-	})
+	r.addRule([]string{"delete"}, resources...)
 	return r
 }
 
 // Can adds custom verbs for the specified resources.
 func (r *RBACBuilder) Can(verbs []string, resources ...string) *RBACBuilder {
-	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
-		Resources: resources,
-		Verbs:     verbs,
-	})
+	r.addRule(verbs, resources...)
 	return r
 }
 
 // CanAll adds all permissions (get, list, watch, create, update, delete) for resources.
 func (r *RBACBuilder) CanAll(resources ...string) *RBACBuilder {
+	r.addRule([]string{"get", "list", "watch", "create", "update", "delete"}, resources...)
+	return r
+}
+
+// ForAPIGroup adds a rule with explicit API group for custom resources.
+// Use this for CRDs or resources not in the built-in mapping.
+func (r *RBACBuilder) ForAPIGroup(apiGroup string, verbs []string, resources ...string) *RBACBuilder {
 	r.rules = append(r.rules, rbacv1.PolicyRule{
-		APIGroups: []string{"", "apps", "batch", "networking.k8s.io"},
+		APIGroups: []string{apiGroup},
 		Resources: resources,
-		Verbs:     []string{"get", "list", "watch", "create", "update", "delete"},
+		Verbs:     verbs,
 	})
 	return r
 }

@@ -15,6 +15,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -3077,6 +3078,90 @@ func TestIngressTestExpectTLS(t *testing.T) {
 			Error()
 		if err == nil {
 			t.Error("TestIngress TLS should fail for wrong secret")
+		}
+	})
+}
+
+// TestWaitPVCBound verifies WaitPVCBound waits for PVC to be bound.
+func TestWaitPVCBound(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a PVC - note: requires a default StorageClass in the cluster
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-pvc"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("1Gi"),
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pvc); err != nil {
+			t.Fatalf("Apply PVC failed: %v", err)
+		}
+
+		// Wait for PVC to be bound (may timeout if no StorageClass provisioner)
+		err := ctx.WaitPVCBoundTimeout("pvc/test-pvc", 30*time.Second)
+		if err != nil {
+			t.Logf("WaitPVCBound returned error (expected if no dynamic provisioning): %v", err)
+		}
+	})
+}
+
+// TestPVCAssertions verifies PVC assertion methods.
+func TestPVCAssertions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a PVC
+		storageClass := "standard"
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "assert-pvc"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				StorageClassName: &storageClass,
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("1Gi"),
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pvc); err != nil {
+			t.Fatalf("Apply PVC failed: %v", err)
+		}
+
+		// Test HasStorageClass - should pass with correct class
+		err := ctx.Assert("pvc/assert-pvc").HasStorageClass("standard").Error()
+		if err != nil {
+			t.Errorf("HasStorageClass should pass: %v", err)
+		}
+
+		// Test HasStorageClass - should fail with wrong class
+		err = ctx.Assert("pvc/assert-pvc").HasStorageClass("premium").Error()
+		if err == nil {
+			t.Error("HasStorageClass should fail for wrong class")
+		}
+
+		// Test IsBound on non-PVC should fail
+		err = ctx.Assert("deployment/test").IsBound().Error()
+		if err == nil {
+			t.Error("IsBound on deployment should fail")
+		}
+
+		// Test HasCapacity on non-PVC should fail
+		err = ctx.Assert("pod/test").HasCapacity("1Gi").Error()
+		if err == nil {
+			t.Error("HasCapacity on pod should fail")
 		}
 	})
 }
