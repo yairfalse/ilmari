@@ -121,6 +121,76 @@ ctx.Kill("pod/myapp-xyz")
 ctx.Isolate(map[string]string{"app": "myapp"})
 ```
 
+### RBAC
+
+```go
+// Create ServiceAccount + Role + RoleBinding in one go
+rbac := ilmari.ServiceAccount("my-sa").
+    WithRole("my-role").
+    CanGet("pods", "services").
+    CanList("deployments").
+    CanWatch("configmaps").
+    Build()
+
+ctx.ApplyRBAC(rbac)
+```
+
+### Secrets
+
+```go
+// From files
+ctx.SecretFromFile("certs", map[string]string{
+    "ca.crt": "/path/to/ca.crt",
+    "tls.crt": "/path/to/tls.crt",
+})
+
+// From environment variables
+ctx.SecretFromEnv("api-keys", "API_KEY", "API_SECRET")
+
+// TLS secret
+ctx.SecretTLS("my-tls", "/path/to/cert.pem", "/path/to/key.pem")
+```
+
+### PVC
+
+```go
+ctx.WaitPVCBound("pvc/my-volume")
+
+ctx.Assert("pvc/data").
+    IsBound().
+    HasStorageClass("standard").
+    HasCapacity("10Gi").
+    Must()
+```
+
+### Ingress Testing
+
+```go
+ctx.TestIngress("my-ingress").
+    Host("api.example.com").
+    Path("/v1").
+    ExpectBackend("api-svc", 8080).
+    ExpectTLS("api-tls-secret").
+    Must()
+```
+
+### Log Aggregation
+
+```go
+// Get logs from all pods matching a selector
+logs, _ := ctx.LogsAll("app=myapp")
+for pod, log := range logs {
+    fmt.Printf("=== %s ===\n%s\n", pod, log)
+}
+
+// With options
+logs, _ := ctx.LogsAllWithOptions("app=myapp", ilmari.LogsOptions{
+    Container: "main",
+    Since:     5 * time.Minute,
+    TailLines: 100,
+})
+```
+
 ## Philosophy
 
 **Code over config.** YAML is a data format that accidentally became a programming language. We'd rather use an actual programming language.
