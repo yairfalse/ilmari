@@ -3989,9 +3989,9 @@ func (c *Context) SecretFromEnv(name string, keys ...string) (err error) {
 
 	data := make(map[string][]byte)
 	for _, key := range keys {
-		value := os.Getenv(key)
-		if value == "" {
-			return fmt.Errorf("environment variable %s is not set or empty", key)
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			return fmt.Errorf("environment variable %s is not set", key)
 		}
 		data[key] = []byte(value)
 	}
