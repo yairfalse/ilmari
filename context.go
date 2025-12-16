@@ -420,6 +420,17 @@ func (c *Context) getGVR(obj runtime.Object) (schema.GroupVersionResource, error
 		gvk = gvks[0]
 	}
 
+	// Handle list types by stripping "List" suffix
+	kind := gvk.Kind
+	if strings.HasSuffix(kind, "List") {
+		kind = strings.TrimSuffix(kind, "List")
+		gvk = schema.GroupVersionKind{
+			Group:   gvk.Group,
+			Version: gvk.Version,
+			Kind:    kind,
+		}
+	}
+
 	mapping, err := c.mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
 		return schema.GroupVersionResource{}, fmt.Errorf("failed to get REST mapping: %w", err)
@@ -443,7 +454,9 @@ func (c *Context) cleanup() error {
 	if err != nil {
 		return fmt.Errorf("failed to delete namespace: %w", err)
 	}
-	c.t.Logf("Deleted test namespace: %s", c.Namespace)
+	if c.t != nil {
+		c.t.Logf("Deleted test namespace: %s", c.Namespace)
+	}
 	return nil
 }
 
