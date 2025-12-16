@@ -2680,15 +2680,26 @@ func TestLogsAllWithOptions(t *testing.T) {
 			t.Fatalf("WaitReady failed: %v", err)
 		}
 
-		time.Sleep(2 * time.Second)
+		// Wait for logs to be available, up to 10 seconds
+		var logs map[string]string
+		var err error
+		const pollInterval = 200 * time.Millisecond
+		const timeout = 10 * time.Second
+		start := time.Now()
+		for {
+			logs, err = ctx.LogsAllWithOptions("app=logs-opts", LogsOptions{
+				TailLines: 2,
+			})
+			if err == nil && len(strings.TrimSpace(logs["logs-opts-test"])) > 0 {
+				break
+			}
+			if time.Since(start) > timeout {
+				t.Fatalf("LogsAllWithOptions did not return logs within %v: last error: %v", timeout, err)
+			}
+			time.Sleep(pollInterval)
+		}
 
 		// Get only last 2 lines
-		logs, err := ctx.LogsAllWithOptions("app=logs-opts", LogsOptions{
-			TailLines: 2,
-		})
-		if err != nil {
-			t.Fatalf("LogsAllWithOptions failed: %v", err)
-		}
 
 		log := logs["logs-opts-test"]
 		lines := strings.Split(strings.TrimSpace(log), "\n")
