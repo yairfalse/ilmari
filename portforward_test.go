@@ -65,7 +65,7 @@ func TestForwardMakesHTTPRequest(t *testing.T) {
 		}
 
 		// Forward and make request
-		pf := ctx.Forward("svc/http-server", 80)
+		pf := ctx.PortForward("svc/http-server", 80)
 		defer pf.Close()
 
 		resp, err := pf.Get("/")
@@ -98,7 +98,7 @@ func TestPortForwardPost(t *testing.T) {
 			t.Fatalf("Up failed: %v", err)
 		}
 
-		pf := ctx.Forward("svc/web", 80)
+		pf := ctx.PortForward("svc/web", 80)
 		defer pf.Close()
 
 		// Test Post - nginx returns 405 for POST to static files
@@ -133,7 +133,7 @@ func TestPortForwardPut(t *testing.T) {
 			t.Fatalf("Up failed: %v", err)
 		}
 
-		pf := ctx.Forward("svc/web", 80)
+		pf := ctx.PortForward("svc/web", 80)
 		defer pf.Close()
 
 		// Test Put - nginx returns 405 for PUT
@@ -168,7 +168,7 @@ func TestPortForwardDelete(t *testing.T) {
 			t.Fatalf("Up failed: %v", err)
 		}
 
-		pf := ctx.Forward("svc/web", 80)
+		pf := ctx.PortForward("svc/web", 80)
 		defer pf.Close()
 
 		// Test Delete - nginx returns 405 for DELETE
@@ -202,7 +202,7 @@ func TestPortForwardDo(t *testing.T) {
 			t.Fatalf("Up failed: %v", err)
 		}
 
-		pf := ctx.Forward("svc/web", 80)
+		pf := ctx.PortForward("svc/web", 80)
 		defer pf.Close()
 
 		// Test Do with custom PATCH request
@@ -243,7 +243,7 @@ func TestPortForwardURL(t *testing.T) {
 			t.Fatalf("Up failed: %v", err)
 		}
 
-		pf := ctx.Forward("svc/web", 80)
+		pf := ctx.PortForward("svc/web", 80)
 		defer pf.Close()
 
 		url := pf.URL("/health")
@@ -273,7 +273,7 @@ func TestPortForwardGetVerify(t *testing.T) {
 			t.Fatalf("Up failed: %v", err)
 		}
 
-		pf := ctx.Forward("svc/web", 80)
+		pf := ctx.PortForward("svc/web", 80)
 		defer pf.Close()
 
 		// GET should return 200 for nginx index

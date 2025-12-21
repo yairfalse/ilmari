@@ -183,7 +183,7 @@ func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffi
 	fn(&config)
 
 	// Set up port forward
-	pf := c.Forward(resource, 80)
+	pf := c.PortForward(resource, 80)
 
 	traffic := &Traffic{
 		ctx:       c,

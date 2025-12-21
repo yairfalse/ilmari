@@ -24,7 +24,7 @@ func main() {
     ctx.WaitReady("deployment/nginx")
 
     // Port forward and test
-    pf := ctx.Forward("deployment/nginx", 80)
+    pf := ctx.PortForward("deployment/nginx", 80)
     defer pf.Close()
     resp, _ := pf.Get("/")
     fmt.Println(resp.StatusCode) // 200
@@ -59,7 +59,7 @@ func TestMyApp(t *testing.T) {
         ctx.Apply(myDeployment)
         ctx.WaitReady("deployment/myapp")
 
-        pf := ctx.Forward("svc/myapp", 8080)
+        pf := ctx.PortForward("svc/myapp", 8080)
         resp, _ := pf.Get("/health")
         assert.Equal(t, 200, resp.StatusCode)
 
@@ -162,7 +162,7 @@ events, _ := ctx.Events()
 ### Port Forwarding
 
 ```go
-pf := ctx.Forward("svc/myapp", 8080)
+pf := ctx.PortForward("svc/myapp", 8080)
 defer pf.Close()
 
 // HTTP methods

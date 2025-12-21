@@ -107,10 +107,10 @@ func (pf *PortForward) Do(req *http.Request) (*http.Response, error) {
 	return pf.httpClient.Do(req)
 }
 
-// Forward creates a port forward to a pod or service.
+// PortForward creates a port forward to a pod or service.
 // Resource format: "svc/name" or "pod/name"
-func (c *Context) Forward(resource string, port int) *PortForward {
-	_, span := c.startSpan(context.Background(), "ilmari.Forward",
+func (c *Context) PortForward(resource string, port int) *PortForward {
+	_, span := c.startSpan(context.Background(), "ilmari.PortForward",
 		attribute.String("resource", resource),
 		attribute.Int("port", port))
 
@@ -219,12 +219,12 @@ func (c *Context) Forward(resource string, port int) *PortForward {
 	}
 }
 
-// MustForward creates a port forward and panics on error.
+// MustPortForward creates a port forward and panics on error.
 // Useful for test setup where errors should fail immediately.
-func (c *Context) MustForward(resource string, port int) *PortForward {
-	pf := c.Forward(resource, port)
+func (c *Context) MustPortForward(resource string, port int) *PortForward {
+	pf := c.PortForward(resource, port)
 	if pf.err != nil {
-		panic(fmt.Sprintf("MustForward failed: %v", pf.err))
+		panic(fmt.Sprintf("MustPortForward failed: %v", pf.err))
 	}
 	return pf
 }
