@@ -997,6 +997,23 @@ func (a *StatefulSetAssertion) HasLabel(key, value string) *StatefulSetAssertion
 	return a
 }
 
+// HasAnnotation asserts the StatefulSet has the specified annotation.
+func (a *StatefulSetAssertion) HasAnnotation(key, value string) *StatefulSetAssertion {
+	if a.err != nil {
+		return a
+	}
+	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if ss.Annotations[key] != value {
+		a.err = fmt.Errorf("StatefulSet %s: expected annotation %s=%s, got %s=%s",
+			a.name, key, value, key, ss.Annotations[key])
+	}
+	return a
+}
 // Error returns any assertion error.
 func (a *StatefulSetAssertion) Error() error {
 	return a.err
