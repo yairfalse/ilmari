@@ -488,6 +488,22 @@ func (a *PVCAssertion) HasLabel(key, value string) *PVCAssertion {
 	return a
 }
 
+// HasAnnotation asserts the PVC has the specified annotation.
+func (a *PVCAssertion) HasAnnotation(key, value string) *PVCAssertion {
+	if a.err != nil {
+		return a
+	}
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if pvc.Annotations[key] != value {
+		a.err = fmt.Errorf("PVC %s: expected annotation %s=%s, got %s=%s", a.name, key, value, key, pvc.Annotations[key])
+	}
+	return a
+}
 // Error returns any assertion error.
 func (a *PVCAssertion) Error() error {
 	return a.err
