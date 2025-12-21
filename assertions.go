@@ -383,6 +383,633 @@ func (a *Assertion) NoOOMKills() *Assertion {
 }
 
 // ============================================================================
+// Typed Assertions - PVC
+// ============================================================================
+
+// PVCAssertion provides fluent assertions for PersistentVolumeClaims.
+type PVCAssertion struct {
+	ctx  *Context
+	name string
+	err  error
+}
+
+// AssertPVC returns a typed assertion builder for a PVC.
+func (c *Context) AssertPVC(name string) *PVCAssertion {
+	return &PVCAssertion{ctx: c, name: name}
+}
+
+// Exists asserts the PVC exists.
+func (a *PVCAssertion) Exists() *PVCAssertion {
+	if a.err != nil {
+		return a
+	}
+	_, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = fmt.Errorf("PVC %s does not exist: %w", a.name, err)
+	}
+	return a
+}
+
+// IsBound asserts the PVC is bound to a volume.
+func (a *PVCAssertion) IsBound() *PVCAssertion {
+	if a.err != nil {
+		return a
+	}
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if pvc.Status.Phase != corev1.ClaimBound {
+		a.err = fmt.Errorf("PVC %s is %s, expected Bound", a.name, pvc.Status.Phase)
+	}
+	return a
+}
+
+// HasStorageClass asserts the PVC uses the specified storage class.
+func (a *PVCAssertion) HasStorageClass(expected string) *PVCAssertion {
+	if a.err != nil {
+		return a
+	}
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	actual := ""
+	if pvc.Spec.StorageClassName != nil {
+		actual = *pvc.Spec.StorageClassName
+	}
+	if actual != expected {
+		a.err = fmt.Errorf("PVC %s has storage class %q, expected %q", a.name, actual, expected)
+	}
+	return a
+}
+
+// HasCapacity asserts the PVC has at least the specified capacity.
+func (a *PVCAssertion) HasCapacity(expected string) *PVCAssertion {
+	if a.err != nil {
+		return a
+	}
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	capacity := pvc.Status.Capacity.Storage()
+	if capacity == nil {
+		a.err = fmt.Errorf("PVC %s has no capacity set", a.name)
+		return a
+	}
+	if capacity.String() != expected {
+		a.err = fmt.Errorf("PVC %s has capacity %s, expected %s", a.name, capacity.String(), expected)
+	}
+	return a
+}
+
+// HasLabel asserts the PVC has the specified label.
+func (a *PVCAssertion) HasLabel(key, value string) *PVCAssertion {
+	if a.err != nil {
+		return a
+	}
+	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if pvc.Labels[key] != value {
+		a.err = fmt.Errorf("PVC %s: expected label %s=%s, got %s=%s", a.name, key, value, key, pvc.Labels[key])
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *PVCAssertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+func (a *PVCAssertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ============================================================================
+// Typed Assertions - Pod
+// ============================================================================
+
+// PodAssertion provides fluent assertions for Pods.
+type PodAssertion struct {
+	ctx  *Context
+	name string
+	err  error
+}
+
+// AssertPod returns a typed assertion builder for a Pod.
+func (c *Context) AssertPod(name string) *PodAssertion {
+	return &PodAssertion{ctx: c, name: name}
+}
+
+// Exists asserts the Pod exists.
+func (a *PodAssertion) Exists() *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	_, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = fmt.Errorf("Pod %s does not exist: %w", a.name, err)
+	}
+	return a
+}
+
+// IsReady asserts the Pod is ready.
+func (a *PodAssertion) IsReady() *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return a
+		}
+	}
+	a.err = fmt.Errorf("Pod %s is not ready", a.name)
+	return a
+}
+
+// HasNoRestarts asserts the Pod's containers have zero restarts.
+func (a *PodAssertion) HasNoRestarts() *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.RestartCount > 0 {
+			a.err = fmt.Errorf("Pod %s: container %s has %d restarts", a.name, cs.Name, cs.RestartCount)
+			return a
+		}
+	}
+	return a
+}
+
+// NoOOMKills asserts the Pod has no OOM-killed containers.
+func (a *PodAssertion) NoOOMKills() *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.LastTerminationState.Terminated != nil &&
+			cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
+			a.err = fmt.Errorf("Pod %s: container %s was OOMKilled", a.name, cs.Name)
+			return a
+		}
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
+			a.err = fmt.Errorf("Pod %s: container %s was OOMKilled", a.name, cs.Name)
+			return a
+		}
+	}
+	return a
+}
+
+// LogsContain asserts the Pod's logs contain the specified text.
+func (a *PodAssertion) LogsContain(text string) *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	logs, err := a.ctx.Logs(a.name)
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if !strings.Contains(logs, text) {
+		a.err = fmt.Errorf("Pod %s: logs do not contain %q", a.name, text)
+	}
+	return a
+}
+
+// HasLabel asserts the Pod has the specified label.
+func (a *PodAssertion) HasLabel(key, value string) *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if pod.Labels[key] != value {
+		a.err = fmt.Errorf("Pod %s: expected label %s=%s, got %s=%s", a.name, key, value, key, pod.Labels[key])
+	}
+	return a
+}
+
+// HasAnnotation asserts the Pod has the specified annotation.
+func (a *PodAssertion) HasAnnotation(key, value string) *PodAssertion {
+	if a.err != nil {
+		return a
+	}
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if pod.Annotations[key] != value {
+		a.err = fmt.Errorf("Pod %s: expected annotation %s=%s, got %s=%s", a.name, key, value, key, pod.Annotations[key])
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *PodAssertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+func (a *PodAssertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ============================================================================
+// Typed Assertions - Deployment
+// ============================================================================
+
+// DeploymentAssertion provides fluent assertions for Deployments.
+type DeploymentAssertion struct {
+	ctx  *Context
+	name string
+	err  error
+}
+
+// AssertDeployment returns a typed assertion builder for a Deployment.
+func (c *Context) AssertDeployment(name string) *DeploymentAssertion {
+	return &DeploymentAssertion{ctx: c, name: name}
+}
+
+// Exists asserts the Deployment exists.
+func (a *DeploymentAssertion) Exists() *DeploymentAssertion {
+	if a.err != nil {
+		return a
+	}
+	_, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = fmt.Errorf("Deployment %s does not exist: %w", a.name, err)
+	}
+	return a
+}
+
+// HasReplicas asserts the Deployment has the specified ready replicas.
+func (a *DeploymentAssertion) HasReplicas(expected int) *DeploymentAssertion {
+	if a.err != nil {
+		return a
+	}
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if int(deploy.Status.ReadyReplicas) != expected {
+		a.err = fmt.Errorf("Deployment %s: expected %d ready replicas, got %d",
+			a.name, expected, deploy.Status.ReadyReplicas)
+	}
+	return a
+}
+
+// IsReady asserts the Deployment is fully available.
+func (a *DeploymentAssertion) IsReady() *DeploymentAssertion {
+	if a.err != nil {
+		return a
+	}
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	desired := int32(1)
+	if deploy.Spec.Replicas != nil {
+		desired = *deploy.Spec.Replicas
+	}
+	if deploy.Status.ReadyReplicas != desired {
+		a.err = fmt.Errorf("Deployment %s: %d/%d replicas ready", a.name, deploy.Status.ReadyReplicas, desired)
+	}
+	return a
+}
+
+// IsProgressing asserts the Deployment is progressing (not stalled).
+func (a *DeploymentAssertion) IsProgressing() *DeploymentAssertion {
+	if a.err != nil {
+		return a
+	}
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	for _, cond := range deploy.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing {
+			if cond.Status == corev1.ConditionTrue {
+				return a
+			}
+			a.err = fmt.Errorf("Deployment %s not progressing: %s", a.name, cond.Message)
+			return a
+		}
+	}
+	a.err = fmt.Errorf("Deployment %s has no Progressing condition", a.name)
+	return a
+}
+
+// HasLabel asserts the Deployment has the specified label.
+func (a *DeploymentAssertion) HasLabel(key, value string) *DeploymentAssertion {
+	if a.err != nil {
+		return a
+	}
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if deploy.Labels[key] != value {
+		a.err = fmt.Errorf("Deployment %s: expected label %s=%s, got %s=%s",
+			a.name, key, value, key, deploy.Labels[key])
+	}
+	return a
+}
+
+// HasAnnotation asserts the Deployment has the specified annotation.
+func (a *DeploymentAssertion) HasAnnotation(key, value string) *DeploymentAssertion {
+	if a.err != nil {
+		return a
+	}
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if deploy.Annotations[key] != value {
+		a.err = fmt.Errorf("Deployment %s: expected annotation %s=%s, got %s=%s",
+			a.name, key, value, key, deploy.Annotations[key])
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *DeploymentAssertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+func (a *DeploymentAssertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ============================================================================
+// Typed Assertions - Service
+// ============================================================================
+
+// ServiceAssertion provides fluent assertions for Services.
+type ServiceAssertion struct {
+	ctx  *Context
+	name string
+	err  error
+}
+
+// AssertService returns a typed assertion builder for a Service.
+func (c *Context) AssertService(name string) *ServiceAssertion {
+	return &ServiceAssertion{ctx: c, name: name}
+}
+
+// Exists asserts the Service exists.
+func (a *ServiceAssertion) Exists() *ServiceAssertion {
+	if a.err != nil {
+		return a
+	}
+	_, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = fmt.Errorf("Service %s does not exist: %w", a.name, err)
+	}
+	return a
+}
+
+// HasLabel asserts the Service has the specified label.
+func (a *ServiceAssertion) HasLabel(key, value string) *ServiceAssertion {
+	if a.err != nil {
+		return a
+	}
+	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if svc.Labels[key] != value {
+		a.err = fmt.Errorf("Service %s: expected label %s=%s, got %s=%s",
+			a.name, key, value, key, svc.Labels[key])
+	}
+	return a
+}
+
+// HasAnnotation asserts the Service has the specified annotation.
+func (a *ServiceAssertion) HasAnnotation(key, value string) *ServiceAssertion {
+	if a.err != nil {
+		return a
+	}
+	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if svc.Annotations[key] != value {
+		a.err = fmt.Errorf("Service %s: expected annotation %s=%s, got %s=%s",
+			a.name, key, value, key, svc.Annotations[key])
+	}
+	return a
+}
+
+// HasPort asserts the Service exposes the specified port.
+func (a *ServiceAssertion) HasPort(port int32) *ServiceAssertion {
+	if a.err != nil {
+		return a
+	}
+	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	for _, p := range svc.Spec.Ports {
+		if p.Port == port {
+			return a
+		}
+	}
+	a.err = fmt.Errorf("Service %s does not expose port %d", a.name, port)
+	return a
+}
+
+// HasSelector asserts the Service has the specified selector.
+func (a *ServiceAssertion) HasSelector(key, value string) *ServiceAssertion {
+	if a.err != nil {
+		return a
+	}
+	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if svc.Spec.Selector[key] != value {
+		a.err = fmt.Errorf("Service %s: expected selector %s=%s, got %s=%s",
+			a.name, key, value, key, svc.Spec.Selector[key])
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *ServiceAssertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+func (a *ServiceAssertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ============================================================================
+// Typed Assertions - StatefulSet
+// ============================================================================
+
+// StatefulSetAssertion provides fluent assertions for StatefulSets.
+type StatefulSetAssertion struct {
+	ctx  *Context
+	name string
+	err  error
+}
+
+// AssertStatefulSet returns a typed assertion builder for a StatefulSet.
+func (c *Context) AssertStatefulSet(name string) *StatefulSetAssertion {
+	return &StatefulSetAssertion{ctx: c, name: name}
+}
+
+// Exists asserts the StatefulSet exists.
+func (a *StatefulSetAssertion) Exists() *StatefulSetAssertion {
+	if a.err != nil {
+		return a
+	}
+	_, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = fmt.Errorf("StatefulSet %s does not exist: %w", a.name, err)
+	}
+	return a
+}
+
+// HasReplicas asserts the StatefulSet has the specified ready replicas.
+func (a *StatefulSetAssertion) HasReplicas(expected int) *StatefulSetAssertion {
+	if a.err != nil {
+		return a
+	}
+	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if int(ss.Status.ReadyReplicas) != expected {
+		a.err = fmt.Errorf("StatefulSet %s: expected %d ready replicas, got %d",
+			a.name, expected, ss.Status.ReadyReplicas)
+	}
+	return a
+}
+
+// IsReady asserts the StatefulSet is fully available.
+func (a *StatefulSetAssertion) IsReady() *StatefulSetAssertion {
+	if a.err != nil {
+		return a
+	}
+	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	desired := int32(1)
+	if ss.Spec.Replicas != nil {
+		desired = *ss.Spec.Replicas
+	}
+	if ss.Status.ReadyReplicas != desired {
+		a.err = fmt.Errorf("StatefulSet %s: %d/%d replicas ready", a.name, ss.Status.ReadyReplicas, desired)
+	}
+	return a
+}
+
+// HasLabel asserts the StatefulSet has the specified label.
+func (a *StatefulSetAssertion) HasLabel(key, value string) *StatefulSetAssertion {
+	if a.err != nil {
+		return a
+	}
+	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
+		context.Background(), a.name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+	if ss.Labels[key] != value {
+		a.err = fmt.Errorf("StatefulSet %s: expected label %s=%s, got %s=%s",
+			a.name, key, value, key, ss.Labels[key])
+	}
+	return a
+}
+
+// Error returns any assertion error.
+func (a *StatefulSetAssertion) Error() error {
+	return a.err
+}
+
+// Must panics if any assertion failed.
+func (a *StatefulSetAssertion) Must() {
+	if a.err != nil {
+		panic(a.err)
+	}
+}
+
+// ============================================================================
 // Eventually/Consistently - Flakiness Protection
 // ============================================================================
 
