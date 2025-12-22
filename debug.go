@@ -20,10 +20,10 @@ type DebugOptions struct {
 	Writer io.Writer
 	// LogLines is the number of log lines to show per pod (default: 20)
 	LogLines int64
-	// ShowEvents controls whether to show events (default: true)
-	ShowEvents bool
-	// ShowLogs controls whether to show logs (default: true)
-	ShowLogs bool
+	// HideEvents disables event output (events shown by default)
+	HideEvents bool
+	// HideLogs disables log output (logs shown by default)
+	HideLogs bool
 }
 
 // Debug prints combined diagnostics for a resource.
@@ -40,10 +40,6 @@ func (c *Context) DebugWithOptions(resource string, opts DebugOptions) error {
 	}
 	if opts.LogLines == 0 {
 		opts.LogLines = 20
-	}
-	if !opts.ShowEvents && !opts.ShowLogs {
-		opts.ShowEvents = true
-		opts.ShowLogs = true
 	}
 
 	parts := strings.SplitN(resource, "/", 2)
@@ -183,12 +179,12 @@ func (c *Context) debugPods(w io.Writer, pods []corev1.Pod, opts DebugOptions) {
 	}
 
 	// Print events if enabled
-	if opts.ShowEvents {
+	if !opts.HideEvents {
 		c.debugEvents(w, pods)
 	}
 
 	// Print logs if enabled
-	if opts.ShowLogs {
+	if !opts.HideLogs {
 		c.debugLogs(w, pods, opts.LogLines)
 	}
 }
