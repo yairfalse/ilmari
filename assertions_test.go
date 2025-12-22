@@ -396,9 +396,9 @@ func TestAssertPodTyped(t *testing.T) {
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{
 					{
-						Name:    "sleep",
+						Name:    "echo",
 						Image:   "busybox:1.36",
-						Command: []string{"sleep", "300"},
+						Command: []string{"sh", "-c", "echo 'typed-pod-marker-xyz' && sleep 300"},
 					},
 				},
 			},
@@ -409,6 +409,9 @@ func TestAssertPodTyped(t *testing.T) {
 		if err := ctx.WaitReady("pod/typed-pod-test"); err != nil {
 			t.Fatalf("WaitReady failed: %v", err)
 		}
+
+		// Wait for logs to be available
+		time.Sleep(2 * time.Second)
 
 		// Test Exists
 		if err := ctx.AssertPod("typed-pod-test").Exists().Error(); err != nil {
@@ -430,6 +433,16 @@ func TestAssertPodTyped(t *testing.T) {
 			t.Errorf("AssertPod.NoOOMKills failed: %v", err)
 		}
 
+		// Test LogsContain
+		if err := ctx.AssertPod("typed-pod-test").LogsContain("typed-pod-marker-xyz").Error(); err != nil {
+			t.Errorf("AssertPod.LogsContain failed: %v", err)
+		}
+
+		// Test LogsContain failure case
+		if err := ctx.AssertPod("typed-pod-test").LogsContain("nonexistent-text-999").Error(); err == nil {
+			t.Error("Expected error for LogsContain with missing text")
+		}
+
 		// Test HasLabel
 		if err := ctx.AssertPod("typed-pod-test").HasLabel("app", "typed-test").Error(); err != nil {
 			t.Errorf("AssertPod.HasLabel failed: %v", err)
@@ -446,6 +459,7 @@ func TestAssertPodTyped(t *testing.T) {
 			IsReady().
 			HasNoRestarts().
 			NoOOMKills().
+			LogsContain("typed-pod-marker-xyz").
 			HasLabel("app", "typed-test").
 			Error(); err != nil {
 			t.Errorf("Chained assertions failed: %v", err)

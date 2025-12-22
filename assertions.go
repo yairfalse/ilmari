@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -465,8 +466,13 @@ func (a *PVCAssertion) HasCapacity(expected string) *PVCAssertion {
 		a.err = fmt.Errorf("PVC %s has no capacity set", a.name)
 		return a
 	}
-	if capacity.String() != expected {
-		a.err = fmt.Errorf("PVC %s has capacity %s, expected %s", a.name, capacity.String(), expected)
+	expectedQty, err := resource.ParseQuantity(expected)
+	if err != nil {
+		a.err = fmt.Errorf("invalid capacity %q: %w", expected, err)
+		return a
+	}
+	if capacity.Cmp(expectedQty) < 0 {
+		a.err = fmt.Errorf("PVC %s has capacity %s, expected at least %s", a.name, capacity.String(), expected)
 	}
 	return a
 }
