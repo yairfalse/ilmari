@@ -259,6 +259,53 @@ ctx.SecretTLS("my-tls", "cert.pem", "key.pem")
 
 ## Assertions
 
+### Typed Assertions (Recommended)
+
+```go
+// Pod assertions
+ctx.AssertPod("api-xyz").
+    Exists().
+    IsReady().
+    HasNoRestarts().
+    NoOOMKills().
+    LogsContain("Server started").
+    HasLabel("app", "api").
+    Must()
+
+// Deployment assertions
+ctx.AssertDeployment("api").
+    Exists().
+    HasReplicas(3).
+    IsReady().
+    IsProgressing().
+    HasLabel("app", "api").
+    Must()
+
+// Service assertions
+ctx.AssertService("api").
+    Exists().
+    HasPort(8080).
+    HasSelector("app", "api").
+    Must()
+
+// PVC assertions
+ctx.AssertPVC("data").
+    Exists().
+    IsBound().
+    HasStorageClass("standard").
+    HasCapacity("10Gi").
+    Must()
+
+// StatefulSet assertions
+ctx.AssertStatefulSet("db").
+    Exists().
+    HasReplicas(3).
+    IsReady().
+    Must()
+```
+
+### Generic Assertions
+
 ```go
 ctx.Assert("deployment/api").
     Exists().
@@ -271,12 +318,6 @@ ctx.Assert("pod/api-xyz").
     HasNoRestarts().
     NoOOMKills().
     LogsContain("Server started").
-    Must()
-
-ctx.Assert("pvc/data").
-    IsBound().
-    HasStorageClass("standard").
-    HasCapacity("10Gi").
     Must()
 ```
 

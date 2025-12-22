@@ -105,7 +105,7 @@ func (c *Context) LogsStream(pod string, fn func(line string)) (stop func())
 func (c *Context) Events() ([]corev1.Event, error)
 
 // Network
-func (c *Context) Forward(svc string, port int) *PortForward
+func (c *Context) PortForward(svc string, port int) *PortForward
 func (c *Context) Exec(pod string, cmd []string) (string, error)
 func (c *Context) CopyTo(pod, localPath, remotePath string) error
 func (c *Context) CopyFrom(pod, remotePath, localPath string) error
@@ -151,20 +151,66 @@ func (pf *PortForward) Close()
 ### Assertions
 
 ```go
-func (c *Context) Assert(resource string) *Assertion
+// Typed assertions (recommended)
+func (c *Context) AssertPod(name string) *PodAssertion
+func (c *Context) AssertDeployment(name string) *DeploymentAssertion
+func (c *Context) AssertService(name string) *ServiceAssertion
+func (c *Context) AssertPVC(name string) *PVCAssertion
+func (c *Context) AssertStatefulSet(name string) *StatefulSetAssertion
 
+// PodAssertion
+func (a *PodAssertion) Exists() *PodAssertion
+func (a *PodAssertion) IsReady() *PodAssertion
+func (a *PodAssertion) HasNoRestarts() *PodAssertion
+func (a *PodAssertion) NoOOMKills() *PodAssertion
+func (a *PodAssertion) LogsContain(text string) *PodAssertion
+func (a *PodAssertion) HasLabel(key, value string) *PodAssertion
+func (a *PodAssertion) HasAnnotation(key, value string) *PodAssertion
+func (a *PodAssertion) Error() error
+func (a *PodAssertion) Must()
+
+// DeploymentAssertion
+func (a *DeploymentAssertion) Exists() *DeploymentAssertion
+func (a *DeploymentAssertion) HasReplicas(n int) *DeploymentAssertion
+func (a *DeploymentAssertion) IsReady() *DeploymentAssertion
+func (a *DeploymentAssertion) IsProgressing() *DeploymentAssertion
+func (a *DeploymentAssertion) HasLabel(key, value string) *DeploymentAssertion
+func (a *DeploymentAssertion) HasAnnotation(key, value string) *DeploymentAssertion
+func (a *DeploymentAssertion) Error() error
+func (a *DeploymentAssertion) Must()
+
+// ServiceAssertion
+func (a *ServiceAssertion) Exists() *ServiceAssertion
+func (a *ServiceAssertion) HasLabel(key, value string) *ServiceAssertion
+func (a *ServiceAssertion) HasAnnotation(key, value string) *ServiceAssertion
+func (a *ServiceAssertion) HasPort(port int32) *ServiceAssertion
+func (a *ServiceAssertion) HasSelector(key, value string) *ServiceAssertion
+func (a *ServiceAssertion) Error() error
+func (a *ServiceAssertion) Must()
+
+// PVCAssertion
+func (a *PVCAssertion) Exists() *PVCAssertion
+func (a *PVCAssertion) IsBound() *PVCAssertion
+func (a *PVCAssertion) HasStorageClass(class string) *PVCAssertion
+func (a *PVCAssertion) HasCapacity(capacity string) *PVCAssertion
+func (a *PVCAssertion) HasLabel(key, value string) *PVCAssertion
+func (a *PVCAssertion) Error() error
+func (a *PVCAssertion) Must()
+
+// StatefulSetAssertion
+func (a *StatefulSetAssertion) Exists() *StatefulSetAssertion
+func (a *StatefulSetAssertion) HasReplicas(n int) *StatefulSetAssertion
+func (a *StatefulSetAssertion) IsReady() *StatefulSetAssertion
+func (a *StatefulSetAssertion) HasLabel(key, value string) *StatefulSetAssertion
+func (a *StatefulSetAssertion) Error() error
+func (a *StatefulSetAssertion) Must()
+
+// Generic assertions (legacy)
+func (c *Context) Assert(resource string) *Assertion
 func (a *Assertion) Exists() *Assertion
 func (a *Assertion) HasLabel(key, value string) *Assertion
-func (a *Assertion) HasReplicas(n int32) *Assertion
-func (a *Assertion) IsProgressing() *Assertion
-func (a *Assertion) HasNoRestarts() *Assertion
-func (a *Assertion) LogsContain(text string) *Assertion
-func (a *Assertion) NoOOMKills() *Assertion
-func (a *Assertion) IsBound() *Assertion              // PVC
-func (a *Assertion) HasStorageClass(class string) *Assertion  // PVC
-func (a *Assertion) HasCapacity(capacity string) *Assertion   // PVC
 func (a *Assertion) Error() error
-func (a *Assertion) Must()  // panics on failure
+func (a *Assertion) Must()
 ```
 
 ### Builders
