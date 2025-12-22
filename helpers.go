@@ -59,6 +59,46 @@ func (c *Context) Logs(pod string) (result string, err error) {
 	return buf.String(), nil
 }
 
+// LogsWithOptions retrieves logs from a pod with options.
+func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (result string, err error) {
+	_, span := c.startSpan(context.Background(), "ilmari.LogsWithOptions",
+		attribute.String("pod", pod))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
+	logOpts := &corev1.PodLogOptions{}
+	if opts.Container != "" {
+		logOpts.Container = opts.Container
+	}
+	if opts.Since > 0 {
+		sinceSeconds := int64(opts.Since.Seconds())
+		logOpts.SinceSeconds = &sinceSeconds
+	}
+	if opts.TailLines > 0 {
+		logOpts.TailLines = &opts.TailLines
+	}
+
+	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, logOpts)
+	stream, err := req.Stream(context.Background())
+	if err != nil {
+		err = fmt.Errorf("failed to get logs: %w", err)
+		return "", err
+	}
+	defer stream.Close()
+
+	buf := new(strings.Builder)
+	if _, err = io.Copy(buf, stream); err != nil {
+		err = fmt.Errorf("failed to read logs: %w", err)
+		return "", err
+	}
+	return buf.String(), nil
+}
+
 // LogsStream streams logs from a pod in real-time.
 // Returns a stop function to cancel the stream. Safe to call multiple times.
 // Each line is passed to the callback as it arrives.

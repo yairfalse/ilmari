@@ -159,6 +159,45 @@ ctx.CopyFrom("mypod", "/tmp/remote.txt", "local.txt")
 events, _ := ctx.Events()
 ```
 
+### Metrics
+
+```go
+// Get pod metrics (requires metrics-server)
+metrics, _ := ctx.Metrics("pod/api-xyz")
+fmt.Println(metrics.CPU)           // "250m"
+fmt.Println(metrics.Memory)        // "512Mi"
+fmt.Println(metrics.CPUPercent)    // 25.0 (percentage of limit)
+fmt.Println(metrics.MemoryPercent) // 50.0
+
+// Detailed per-container metrics
+detail, _ := ctx.MetricsDetail("pod/api-xyz")
+for _, c := range detail.Containers {
+    fmt.Printf("%s: CPU=%s Memory=%s\n", c.Name, c.CPU, c.Memory)
+}
+```
+
+### Debug
+
+```go
+// Print combined diagnostics for a deployment
+ctx.Debug("deployment/api")
+
+// Output:
+// === deployment/api ===
+// Status: 3/3 ready
+//
+// === Pods ===
+// api-xyz-123: Running (0 restarts)
+// api-xyz-456: Running (0 restarts)
+//
+// === Events ===
+// 10m Scheduled: Assigned to node-1
+// 10m Pulled: Image pulled
+//
+// === Logs (last 20 lines) ===
+// [api-xyz-123] Server started on :8080
+```
+
 ### Port Forwarding
 
 ```go

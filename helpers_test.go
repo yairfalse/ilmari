@@ -949,3 +949,102 @@ func TestAllowFromCreatesNetworkPolicy(t *testing.T) {
 		}
 	})
 }
+
+// TestLogsWithOptionsRetrievesTailLines verifies LogsWithOptions respects TailLines.
+func TestLogsWithOptionsRetrievesTailLines(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod that outputs multiple lines
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "logs-opts-tail-test",
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10; do echo line$i; done; sleep 60"},
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/logs-opts-tail-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait for logs to be available
+		time.Sleep(2 * time.Second)
+
+		// Get only last 3 lines
+		logs, err := ctx.LogsWithOptions("logs-opts-tail-test", LogsOptions{TailLines: 3})
+		if err != nil {
+			t.Fatalf("LogsWithOptions failed: %v", err)
+		}
+
+		lines := strings.Split(strings.TrimSpace(logs), "\n")
+		if len(lines) > 3 {
+			t.Errorf("expected at most 3 lines, got %d: %v", len(lines), lines)
+		}
+	})
+}
+
+// TestLogsWithOptionsRetrievesSince verifies LogsWithOptions respects Since.
+func TestLogsWithOptionsRetrievesSince(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	Run(t, func(ctx *Context) {
+		// Create a pod that outputs lines over time
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "logs-opts-since-test",
+			},
+			Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers: []corev1.Container{
+					{
+						Name:    "echo",
+						Image:   "busybox:1.36",
+						Command: []string{"sh", "-c", "echo early; sleep 5; echo late; sleep 60"},
+					},
+				},
+			},
+		}
+
+		if err := ctx.Apply(pod); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		if err := ctx.WaitReady("pod/logs-opts-since-test"); err != nil {
+			t.Fatalf("WaitReady failed: %v", err)
+		}
+
+		// Wait for both logs to appear
+		time.Sleep(7 * time.Second)
+
+		// Get logs from last 3 seconds (should only see "late")
+		logs, err := ctx.LogsWithOptions("logs-opts-since-test", LogsOptions{Since: 3 * time.Second})
+		if err != nil {
+			t.Fatalf("LogsWithOptions failed: %v", err)
+		}
+
+		// Should contain "late" but not "early"
+		if strings.Contains(logs, "early") {
+			t.Errorf("expected logs since 3s to not contain 'early', got: %s", logs)
+		}
+		if !strings.Contains(logs, "late") {
+			t.Errorf("expected logs since 3s to contain 'late', got: %s", logs)
+		}
+	})
+}

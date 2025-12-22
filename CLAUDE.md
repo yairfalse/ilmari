@@ -101,8 +101,15 @@ func (c *Context) Consistently(fn func() bool) *ConsistentlyBuilder
 
 // Diagnostics
 func (c *Context) Logs(pod string) (string, error)
+func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (string, error)
 func (c *Context) LogsStream(pod string, fn func(line string)) (stop func())
 func (c *Context) Events() ([]corev1.Event, error)
+func (c *Context) Debug(resource string) error
+func (c *Context) DebugWithOptions(resource string, opts DebugOptions) error
+
+// Metrics (requires metrics-server)
+func (c *Context) Metrics(pod string) (*PodMetrics, error)
+func (c *Context) MetricsDetail(pod string) (*PodMetricsDetail, error)
 
 // Network
 func (c *Context) PortForward(svc string, port int) *PortForward
