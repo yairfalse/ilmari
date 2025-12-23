@@ -124,7 +124,7 @@ func (c *Context) WaitDeleted(resource string) error {
 func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return newResourceFormatError(resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -214,7 +214,11 @@ func (c *Context) resourceExists(kind, name string) (bool, error) {
 	if fn, ok := resourceFuncs[kind]; ok {
 		return fn(ctx, c, name)
 	}
-	return false, fmt.Errorf("unsupported kind: %s", kind)
+	return false, &UnsupportedKindError{
+		Operation:      "WaitDeleted",
+		Kind:           kind,
+		SupportedKinds: []string{"pod", "deployment", "configmap", "secret", "service", "statefulset", "daemonset"},
+	}
 }
 
 // PatchType specifies the type of patch operation.
@@ -234,7 +238,7 @@ const (
 func (c *Context) Patch(resource string, patch []byte, patchType PatchType) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return newResourceFormatError(resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -288,7 +292,11 @@ func (c *Context) Patch(resource string, patch []byte, patchType PatchType) erro
 
 	patchFunc, ok := patchFuncs[kind]
 	if !ok {
-		return fmt.Errorf("unsupported kind: %s", kind)
+		return &UnsupportedKindError{
+			Operation:      "Patch",
+			Kind:           kind,
+			SupportedKinds: []string{"pod", "deployment", "configmap", "secret", "service", "statefulset", "daemonset"},
+		}
 	}
 	return patchFunc()
 }

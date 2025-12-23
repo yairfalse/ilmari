@@ -266,7 +266,11 @@ func (c *Context) Kill(resource string) error {
 	if strings.Contains(resource, "/") {
 		parts := strings.SplitN(resource, "/", 2)
 		if strings.ToLower(parts[0]) != "pod" {
-			return fmt.Errorf("Kill only supports pods, got %s", parts[0])
+			return &UnsupportedKindError{
+				Operation:      "Kill",
+				Kind:           parts[0],
+				SupportedKinds: []string{"pod"},
+			}
 		}
 		podName = parts[1]
 	} else {

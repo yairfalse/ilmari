@@ -22,7 +22,7 @@ import (
 func (c *Context) Scale(resource string, replicas int) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return newResourceFormatError(resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -50,7 +50,11 @@ func (c *Context) Scale(resource string, replicas int) error {
 		return err
 
 	default:
-		return fmt.Errorf("Scale not supported for kind: %s", kind)
+		return &UnsupportedKindError{
+			Operation:      "Scale",
+			Kind:           kind,
+			SupportedKinds: []string{"deployment", "statefulset"},
+		}
 	}
 }
 
@@ -59,7 +63,7 @@ func (c *Context) Scale(resource string, replicas int) error {
 func (c *Context) Restart(resource string) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return newResourceFormatError(resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -105,7 +109,11 @@ func (c *Context) Restart(resource string) error {
 		return err
 
 	default:
-		return fmt.Errorf("Restart not supported for kind: %s", kind)
+		return &UnsupportedKindError{
+			Operation:      "Restart",
+			Kind:           kind,
+			SupportedKinds: []string{"deployment", "statefulset", "daemonset"},
+		}
 	}
 }
 
@@ -114,14 +122,18 @@ func (c *Context) Restart(resource string) error {
 func (c *Context) Rollback(resource string) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+		return newResourceFormatError(resource)
 	}
 
 	kind := strings.ToLower(parts[0])
 	name := parts[1]
 
 	if kind != "deployment" {
-		return fmt.Errorf("Rollback only supported for deployments, got: %s", kind)
+		return &UnsupportedKindError{
+			Operation:      "Rollback",
+			Kind:           kind,
+			SupportedKinds: []string{"deployment"},
+		}
 	}
 
 	ctx := context.Background()

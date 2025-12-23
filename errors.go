@@ -5,6 +5,76 @@ import (
 	"strings"
 )
 
+// ============================================================================
+// Error Helpers - Provide actionable remediation hints
+// ============================================================================
+
+// ResourceFormatError is returned when a resource string is malformed.
+type ResourceFormatError struct {
+	Input    string
+	Expected string
+}
+
+func (e *ResourceFormatError) Error() string {
+	return fmt.Sprintf("invalid resource format %q\n"+
+		"  Expected: %s\n"+
+		"  Examples: \"deployment/myapp\", \"pod/nginx-xyz\", \"svc/api\"",
+		e.Input, e.Expected)
+}
+
+// newResourceFormatError creates an error for invalid resource format.
+func newResourceFormatError(input string) error {
+	return &ResourceFormatError{
+		Input:    input,
+		Expected: "kind/name",
+	}
+}
+
+// ResourceNotFoundError provides hints when a resource doesn't exist.
+type ResourceNotFoundError struct {
+	Kind      string
+	Name      string
+	Namespace string
+}
+
+func (e *ResourceNotFoundError) Error() string {
+	return fmt.Sprintf("%s %q not found in namespace %q\n"+
+		"  → Verify the resource exists: kubectl get %s %s -n %s\n"+
+		"  → Check for typos in the name\n"+
+		"  → Ensure you're in the correct namespace",
+		e.Kind, e.Name, e.Namespace, e.Kind, e.Name, e.Namespace)
+}
+
+// KubeconfigError provides hints for kubeconfig issues.
+type KubeconfigError struct {
+	Underlying error
+}
+
+func (e *KubeconfigError) Error() string {
+	return fmt.Sprintf("failed to load kubeconfig: %v\n"+
+		"  → Set KUBECONFIG environment variable\n"+
+		"  → Or ensure ~/.kube/config exists\n"+
+		"  → For in-cluster: verify ServiceAccount permissions",
+		e.Underlying)
+}
+
+func (e *KubeconfigError) Unwrap() error {
+	return e.Underlying
+}
+
+// UnsupportedKindError is returned when an operation doesn't support a resource kind.
+type UnsupportedKindError struct {
+	Operation      string
+	Kind           string
+	SupportedKinds []string
+}
+
+func (e *UnsupportedKindError) Error() string {
+	return fmt.Sprintf("%s does not support kind %q\n"+
+		"  Supported: %s",
+		e.Operation, e.Kind, strings.Join(e.SupportedKinds, ", "))
+}
+
 // WaitError provides rich diagnostic information when a wait operation fails.
 type WaitError struct {
 	Resource string
