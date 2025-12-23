@@ -76,7 +76,6 @@ func (c *Context) Close()
 func WithNamespace(ns string) ContextOption      // shared, no cleanup
 func WithIsolatedNamespace(prefix string) ContextOption  // isolated, auto-cleanup
 func WithKubeconfig(path string) ContextOption
-func WithTracerProvider(tp trace.TracerProvider) ContextOption
 
 // Resource operations
 func (c *Context) Apply(obj runtime.Object) error

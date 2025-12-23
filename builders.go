@@ -8,8 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -138,30 +136,18 @@ func (sb *ServiceBuilder) Build() *Stack {
 }
 
 // Up deploys the stack and waits for all services to be ready.
-func (c *Context) Up(stack *Stack) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Up",
-		attribute.Int("service_count", len(stack.services)))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Up(stack *Stack) error {
 	// Deploy all services
 	for _, svc := range stack.services {
-		if err = c.deployService(svc); err != nil {
-			err = fmt.Errorf("failed to deploy %s: %w", svc.name, err)
-			return err
+		if err := c.deployService(svc); err != nil {
+			return fmt.Errorf("failed to deploy %s: %w", svc.name, err)
 		}
 	}
 
 	// Wait for all deployments to be ready
 	for _, svc := range stack.services {
-		if err = c.WaitReady("deployment/" + svc.name); err != nil {
-			err = fmt.Errorf("failed waiting for %s: %w", svc.name, err)
-			return err
+		if err := c.WaitReady("deployment/" + svc.name); err != nil {
+			return fmt.Errorf("failed waiting for %s: %w", svc.name, err)
 		}
 	}
 
@@ -253,18 +239,9 @@ func (c *Context) deployService(sb *ServiceBuilder) error {
 // Retry executes fn up to maxAttempts times with exponential backoff.
 // Backoff starts at 100ms and doubles each attempt, capped at 5s.
 // Returns nil on first success, or the last error after all attempts fail.
-func (c *Context) Retry(maxAttempts int, fn func() error) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Retry",
-		attribute.Int("max_attempts", maxAttempts))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Retry(maxAttempts int, fn func() error) error {
 	backoff := 100 * time.Millisecond
+	var err error
 	for i := 0; i < maxAttempts; i++ {
 		err = fn()
 		if err == nil {
@@ -283,24 +260,13 @@ func (c *Context) Retry(maxAttempts int, fn func() error) (err error) {
 
 // Kill deletes a pod, useful for chaos testing.
 // Resource format: "pod/name" or just "name" (assumes pod)
-func (c *Context) Kill(resource string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Kill",
-		attribute.String("resource", resource))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Kill(resource string) error {
 	// Parse resource
 	var podName string
 	if strings.Contains(resource, "/") {
 		parts := strings.SplitN(resource, "/", 2)
 		if strings.ToLower(parts[0]) != "pod" {
-			err = fmt.Errorf("Kill only supports pods, got %s", parts[0])
-			return err
+			return fmt.Errorf("Kill only supports pods, got %s", parts[0])
 		}
 		podName = parts[1]
 	} else {
@@ -309,12 +275,11 @@ func (c *Context) Kill(resource string) (err error) {
 
 	// Delete with zero grace period for immediate termination
 	grace := int64(0)
-	err = c.Client.CoreV1().Pods(c.Namespace).Delete(
+	return c.Client.CoreV1().Pods(c.Namespace).Delete(
 		context.Background(),
 		podName,
 		metav1.DeleteOptions{GracePeriodSeconds: &grace},
 	)
-	return err
 }
 
 // ============================================================================
@@ -323,17 +288,7 @@ func (c *Context) Kill(resource string) (err error) {
 
 // LoadYAML loads and applies a YAML file from the given path.
 // Supports single or multi-document YAML files.
-func (c *Context) LoadYAML(path string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.LoadYAML",
-		attribute.String("path", path))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) LoadYAML(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read file %s: %w", path, err)
@@ -344,17 +299,7 @@ func (c *Context) LoadYAML(path string) (err error) {
 
 // LoadYAMLDir loads and applies all YAML files from a directory.
 // Only processes .yaml and .yml files in the top-level directory (non-recursive).
-func (c *Context) LoadYAMLDir(dir string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.LoadYAMLDir",
-		attribute.String("dir", dir))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) LoadYAMLDir(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("failed to read directory %s: %w", dir, err)

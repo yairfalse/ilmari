@@ -9,8 +9,6 @@ import (
 	"strings"
 	"text/template"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -125,19 +123,7 @@ func mergeMaps(a, b map[string]interface{}) map[string]interface{} {
 
 // ApplyDynamic applies an unstructured object using the dynamic client.
 // Useful for CRDs or when you don't have typed structs.
-func (c *Context) ApplyDynamic(gvr schema.GroupVersionResource, obj map[string]interface{}) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.ApplyDynamic",
-		attribute.String("group", gvr.Group),
-		attribute.String("version", gvr.Version),
-		attribute.String("resource", gvr.Resource))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) ApplyDynamic(gvr schema.GroupVersionResource, obj map[string]interface{}) error {
 	// Set namespace if not set
 	metadata, ok := obj["metadata"].(map[string]interface{})
 	if !ok {
@@ -157,33 +143,20 @@ func (c *Context) ApplyDynamic(gvr schema.GroupVersionResource, obj map[string]i
 	_, getErr := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(getErr) {
 		// Create
-		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, u, metav1.CreateOptions{})
+		_, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Create(ctx, u, metav1.CreateOptions{})
+		return err
 	} else if getErr != nil {
-		err = getErr
-	} else {
-		// Update
-		_, err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, u, metav1.UpdateOptions{})
+		return getErr
 	}
 
+	// Update
+	_, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Update(ctx, u, metav1.UpdateOptions{})
 	return err
 }
 
 // GetDynamic retrieves an object using the dynamic client.
 // Returns the object as a map[string]interface{}.
-func (c *Context) GetDynamic(gvr schema.GroupVersionResource, name string) (result map[string]interface{}, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.GetDynamic",
-		attribute.String("group", gvr.Group),
-		attribute.String("version", gvr.Version),
-		attribute.String("resource", gvr.Resource),
-		attribute.String("name", name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) GetDynamic(gvr schema.GroupVersionResource, name string) (map[string]interface{}, error) {
 	u, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -193,44 +166,18 @@ func (c *Context) GetDynamic(gvr schema.GroupVersionResource, name string) (resu
 }
 
 // DeleteDynamic deletes an object using the dynamic client.
-func (c *Context) DeleteDynamic(gvr schema.GroupVersionResource, name string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.DeleteDynamic",
-		attribute.String("group", gvr.Group),
-		attribute.String("version", gvr.Version),
-		attribute.String("resource", gvr.Resource),
-		attribute.String("name", name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
-	err = c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
-	return err
+func (c *Context) DeleteDynamic(gvr schema.GroupVersionResource, name string) error {
+	return c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
 }
 
 // ListDynamic lists objects using the dynamic client.
-func (c *Context) ListDynamic(gvr schema.GroupVersionResource) (result []map[string]interface{}, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.ListDynamic",
-		attribute.String("group", gvr.Group),
-		attribute.String("version", gvr.Version),
-		attribute.String("resource", gvr.Resource))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) ListDynamic(gvr schema.GroupVersionResource) ([]map[string]interface{}, error) {
 	list, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	result = make([]map[string]interface{}, len(list.Items))
+	result := make([]map[string]interface{}, len(list.Items))
 	for i, item := range list.Items {
 		result[i] = item.Object
 	}

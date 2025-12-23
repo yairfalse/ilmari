@@ -38,11 +38,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Context provides a Kubernetes connection for SDK operations.
@@ -58,9 +53,6 @@ type Context struct {
 
 	// t is the test instance for logging (optional, nil for standalone usage)
 	t *testing.T
-
-	// tracer for OpenTelemetry tracing (optional)
-	tracer trace.Tracer
 
 	// mapper for GVK to GVR discovery
 	mapper *restmapper.DeferredDiscoveryRESTMapper
@@ -82,9 +74,6 @@ type Config struct {
 
 	// Kubeconfig path (default: uses KUBECONFIG or ~/.kube/config)
 	Kubeconfig string
-
-	// TracerProvider for OpenTelemetry tracing (optional)
-	TracerProvider trace.TracerProvider
 }
 
 // DefaultConfig returns the default configuration.
@@ -108,7 +97,6 @@ type contextOptions struct {
 	kubeconfig     string
 	namespace      string // use existing namespace (shared)
 	isolatedPrefix string // create isolated namespace with prefix
-	tracerProvider trace.TracerProvider
 }
 
 // WithKubeconfig sets a custom kubeconfig path.
@@ -133,13 +121,6 @@ func WithIsolatedNamespace(prefix string) ContextOption {
 	return func(o *contextOptions) {
 		o.isolatedPrefix = prefix
 		o.namespace = "" // clear shared if set
-	}
-}
-
-// WithTracerProvider sets a custom OpenTelemetry tracer provider.
-func WithTracerProvider(tp trace.TracerProvider) ContextOption {
-	return func(o *contextOptions) {
-		o.tracerProvider = tp
 	}
 }
 
@@ -194,18 +175,9 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 		&cachedDiscovery{DiscoveryInterface: discoveryClient},
 	)
 
-	// Initialize tracer
-	var tracer trace.Tracer
-	if options.tracerProvider != nil {
-		tracer = options.tracerProvider.Tracer("ilmari")
-	} else {
-		tracer = otel.Tracer("ilmari")
-	}
-
 	ctx := &Context{
 		Client:     client,
 		Dynamic:    dynamicClient,
-		tracer:     tracer,
 		mapper:     mapper,
 		restConfig: config,
 	}
@@ -338,20 +310,11 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 
 	t.Logf("Created test namespace: %s", namespace)
 
-	// Initialize tracer if configured
-	var tracer trace.Tracer
-	if cfg.TracerProvider != nil {
-		tracer = cfg.TracerProvider.Tracer("ilmari")
-	} else {
-		tracer = otel.Tracer("ilmari")
-	}
-
 	return &Context{
 		Client:        client,
 		Dynamic:       dynamicClient,
 		Namespace:     namespace,
 		t:             t,
-		tracer:        tracer,
 		mapper:        mapper,
 		ownsNamespace: true,
 		restConfig:    config,
@@ -492,12 +455,6 @@ var commonKindMappings = map[string]schema.GroupVersionResource{
 	"clusterissuer": {Group: "cert-manager.io", Version: "v1", Resource: "clusterissuers"},
 }
 
-// startSpan starts a new span for tracing.
-func (c *Context) startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
-	attrs = append(attrs, attribute.String("namespace", c.Namespace))
-	return c.tracer.Start(ctx, name, trace.WithAttributes(attrs...))
-}
-
 // cleanup deletes the test namespace.
 func (c *Context) cleanup() error {
 	err := c.Client.CoreV1().Namespaces().Delete(
@@ -570,22 +527,11 @@ func (c *Context) dumpDiagnostics() {
 // Apply creates or updates a resource.
 // Works with any resource type including CRDs.
 // Automatically detects cluster-scoped vs namespaced resources.
-func (c *Context) Apply(obj runtime.Object) (err error) {
+func (c *Context) Apply(obj runtime.Object) error {
 	gvr, err := c.getGVR(obj)
 	if err != nil {
 		return err
 	}
-
-	_, span := c.startSpan(context.Background(), "ilmari.Apply",
-		attribute.String("resource", gvr.Resource),
-		attribute.String("group", gvr.Group))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
 
 	// Convert to unstructured
 	u, err := toUnstructured(obj)
@@ -620,22 +566,11 @@ func (c *Context) Apply(obj runtime.Object) (err error) {
 // Get retrieves a resource.
 // Works with any resource type including CRDs.
 // Automatically detects cluster-scoped vs namespaced resources.
-func (c *Context) Get(name string, obj runtime.Object) (err error) {
+func (c *Context) Get(name string, obj runtime.Object) error {
 	gvr, err := c.getGVR(obj)
 	if err != nil {
 		return err
 	}
-
-	_, span := c.startSpan(context.Background(), "ilmari.Get",
-		attribute.String("resource", gvr.Resource),
-		attribute.String("name", name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
 
 	// Auto-detect: use cluster or namespaced client
 	var client dynamic.ResourceInterface
@@ -657,22 +592,11 @@ func (c *Context) Get(name string, obj runtime.Object) (err error) {
 // Delete removes a resource.
 // Works with any resource type including CRDs.
 // Automatically detects cluster-scoped vs namespaced resources.
-func (c *Context) Delete(name string, obj runtime.Object) (err error) {
+func (c *Context) Delete(name string, obj runtime.Object) error {
 	gvr, err := c.getGVR(obj)
 	if err != nil {
 		return err
 	}
-
-	_, span := c.startSpan(context.Background(), "ilmari.Delete",
-		attribute.String("resource", gvr.Resource),
-		attribute.String("name", name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
 
 	// Auto-detect: use cluster or namespaced client
 	var client dynamic.ResourceInterface
@@ -689,21 +613,11 @@ func (c *Context) Delete(name string, obj runtime.Object) (err error) {
 // Works with any resource type including CRDs.
 // For namespaced resources, lists only in the current namespace.
 // For cluster-scoped resources, lists all.
-func (c *Context) List(list runtime.Object) (err error) {
+func (c *Context) List(list runtime.Object) error {
 	gvr, err := c.getGVR(list)
 	if err != nil {
 		return err
 	}
-
-	_, span := c.startSpan(context.Background(), "ilmari.List",
-		attribute.String("resource", gvr.Resource))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
 
 	// Auto-detect: use cluster or namespaced client
 	var client dynamic.ResourceInterface
@@ -739,22 +653,10 @@ func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool)
 }
 
 // WaitForTimeout waits for a custom condition with timeout.
-func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.WaitFor",
-		attribute.String("resource", resource),
-		attribute.Int64("timeout_ms", timeout.Milliseconds()))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
-		return err
+		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -767,9 +669,8 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	defer ticker.Stop()
 
 	for {
-		obj, getErr := c.getResource(kind, name)
-		if getErr != nil {
-			err = getErr
+		obj, err := c.getResource(kind, name)
+		if err != nil {
 			return err
 		}
 		if obj != nil && condition(obj) {
@@ -778,8 +679,7 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 
 		select {
 		case <-ctx.Done():
-			err = fmt.Errorf("timeout waiting for %s", resource)
-			return err
+			return fmt.Errorf("timeout waiting for %s", resource)
 		case <-ticker.C:
 		}
 	}
@@ -875,22 +775,10 @@ func (c *Context) getResourceDynamic(kind, name string) (interface{}, error) {
 }
 
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
-func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.WaitReady",
-		attribute.String("resource", resource),
-		attribute.Int64("timeout_ms", timeout.Milliseconds()))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
-		return err
+		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -903,8 +791,7 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err 
 	defer ticker.Stop()
 
 	for {
-		var ready bool
-		ready, err = c.isReady(kind, name)
+		ready, err := c.isReady(kind, name)
 		if err != nil {
 			return err
 		}
@@ -914,8 +801,7 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) (err 
 
 		select {
 		case <-ctx.Done():
-			err = c.buildWaitError(resource, kind, name)
-			return err
+			return c.buildWaitError(resource, kind, name)
 		case <-ticker.C:
 		}
 	}

@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -29,15 +27,10 @@ type WatchEvent struct {
 // Returns a stop function to cancel the watch. Safe to call multiple times.
 // The callback is invoked for each event (ADDED, MODIFIED, DELETED).
 func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
-	_, span := c.startSpan(context.Background(), "ilmari.Watch",
-		attribute.String("kind", kind))
-
 	stopChan := make(chan struct{})
 	var stopOnce sync.Once
 
 	go func() {
-		defer span.End()
-
 		ctx := context.Background()
 		kind = strings.ToLower(kind)
 
@@ -71,13 +64,11 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 
 		factory, ok := watcherFactories[kind]
 		if !ok {
-			span.RecordError(fmt.Errorf("unsupported kind: %s", kind))
-			return
+			return // unsupported kind
 		}
 		watcher, err = factory(ctx, c)
 
 		if err != nil {
-			span.RecordError(err)
 			return
 		}
 		defer watcher.Stop()
@@ -130,22 +121,10 @@ func (c *Context) WaitDeleted(resource string) error {
 }
 
 // WaitDeletedTimeout waits for a resource to be deleted with custom timeout.
-func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.WaitDeleted",
-		attribute.String("resource", resource),
-		attribute.Int64("timeout_ms", timeout.Milliseconds()))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
-		return err
+		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -158,9 +137,8 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) (er
 	defer ticker.Stop()
 
 	for {
-		exists, checkErr := c.resourceExists(kind, name)
-		if checkErr != nil {
-			err = checkErr
+		exists, err := c.resourceExists(kind, name)
+		if err != nil {
 			return err
 		}
 		if !exists {
@@ -169,8 +147,7 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) (er
 
 		select {
 		case <-ctx.Done():
-			err = fmt.Errorf("timeout waiting for %s to be deleted", resource)
-			return err
+			return fmt.Errorf("timeout waiting for %s to be deleted", resource)
 		case <-ticker.C:
 		}
 	}
@@ -254,22 +231,10 @@ const (
 
 // Patch applies a patch to a resource.
 // Resource format: "kind/name" (e.g., "deployment/myapp")
-func (c *Context) Patch(resource string, patch []byte, patchType PatchType) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Patch",
-		attribute.String("resource", resource),
-		attribute.String("patch_type", string(patchType)))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Patch(resource string, patch []byte, patchType PatchType) error {
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		err = fmt.Errorf("invalid resource format %q, expected kind/name", resource)
-		return err
+		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
 	}
 
 	kind := strings.ToLower(parts[0])
@@ -323,10 +288,7 @@ func (c *Context) Patch(resource string, patch []byte, patchType PatchType) (err
 
 	patchFunc, ok := patchFuncs[kind]
 	if !ok {
-		err = fmt.Errorf("unsupported kind: %s", kind)
-		return err
+		return fmt.Errorf("unsupported kind: %s", kind)
 	}
-	err = patchFunc()
-
-	return err
+	return patchFunc()
 }

@@ -10,9 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,7 +24,6 @@ type PortForward struct {
 	doneChan   chan struct{}
 	httpClient *http.Client
 	err        error
-	span       trace.Span
 	closeOnce  sync.Once
 }
 
@@ -40,9 +36,6 @@ func (pf *PortForward) Close() {
 		}
 		if pf.doneChan != nil {
 			<-pf.doneChan
-		}
-		if pf.span != nil {
-			pf.span.End()
 		}
 	})
 }
@@ -110,28 +103,13 @@ func (pf *PortForward) Do(req *http.Request) (*http.Response, error) {
 // PortForward creates a port forward to a pod or service.
 // Resource format: "svc/name" or "pod/name"
 func (c *Context) PortForward(resource string, port int) *PortForward {
-	_, span := c.startSpan(context.Background(), "ilmari.PortForward",
-		attribute.String("resource", resource),
-		attribute.Int("port", port))
-
 	parts := strings.SplitN(resource, "/", 2)
 	if len(parts) != 2 {
-		span.RecordError(fmt.Errorf("invalid resource format"))
-		span.SetStatus(codes.Error, "invalid resource format")
-		span.End()
 		return &PortForward{err: fmt.Errorf("invalid resource format %q, expected kind/name", resource)}
 	}
 
 	kind := strings.ToLower(parts[0])
 	name := parts[1]
-
-	// Helper to return error with span handling
-	returnErr := func(err error) *PortForward {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		span.End()
-		return &PortForward{err: err}
-	}
 
 	// Get pod name
 	var podName string
@@ -144,7 +122,7 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 		// Get service and find a pod
 		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return returnErr(fmt.Errorf("failed to get service: %w", err))
+			return &PortForward{err: fmt.Errorf("failed to get service: %w", err)}
 		}
 
 		// Find pods matching the service selector
@@ -152,25 +130,25 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 			LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		})
 		if err != nil {
-			return returnErr(fmt.Errorf("failed to list pods: %w", err))
+			return &PortForward{err: fmt.Errorf("failed to list pods: %w", err)}
 		}
 		if len(pods.Items) == 0 {
-			return returnErr(fmt.Errorf("no pods found for service %s", name))
+			return &PortForward{err: fmt.Errorf("no pods found for service %s", name)}
 		}
 		podName = pods.Items[0].Name
 	default:
-		return returnErr(fmt.Errorf("unsupported kind %q, use pod or svc", kind))
+		return &PortForward{err: fmt.Errorf("unsupported kind %q, use pod or svc", kind)}
 	}
 
 	// Set up port forward
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		return returnErr(fmt.Errorf("failed to get config: %w", err))
+		return &PortForward{err: fmt.Errorf("failed to get config: %w", err)}
 	}
 
 	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
 	if err != nil {
-		return returnErr(fmt.Errorf("failed to create round tripper: %w", err))
+		return &PortForward{err: fmt.Errorf("failed to create round tripper: %w", err)}
 	}
 
 	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", c.Namespace, podName)
@@ -187,7 +165,7 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 	ports := []string{fmt.Sprintf("0:%d", port)}
 	pf, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard)
 	if err != nil {
-		return returnErr(fmt.Errorf("failed to create port forward: %w", err))
+		return &PortForward{err: fmt.Errorf("failed to create port forward: %w", err)}
 	}
 
 	doneChan := make(chan struct{})
@@ -201,21 +179,19 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 	select {
 	case <-readyChan:
 	case err := <-errChan:
-		return returnErr(fmt.Errorf("port forward failed: %w", err))
+		return &PortForward{err: fmt.Errorf("port forward failed: %w", err)}
 	}
 
 	forwardedPorts, err := pf.GetPorts()
 	if err != nil || len(forwardedPorts) == 0 {
-		return returnErr(fmt.Errorf("failed to get forwarded ports: %w", err))
+		return &PortForward{err: fmt.Errorf("failed to get forwarded ports: %w", err)}
 	}
 
-	// Return with span - it will be closed in PortForward.Close()
 	return &PortForward{
 		localPort:  int(forwardedPorts[0].Local),
 		stopChan:   stopChan,
 		doneChan:   doneChan,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
-		span:       span,
 	}
 }
 
