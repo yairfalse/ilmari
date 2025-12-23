@@ -417,21 +417,6 @@ deploy, _ := ctx.LoadFixture("fixtures/base.yaml").
     Build()
 ```
 
-## Helm
-
-```go
-objects, _ := ilmari.FromHelm("./charts/myapp", "release-name", map[string]interface{}{
-    "replicaCount": 3,
-    "image": map[string]interface{}{
-        "tag": "v1.2.3",
-    },
-})
-
-for _, obj := range objects {
-    ctx.Apply(obj)
-}
-```
-
 ## Test Scenarios
 
 ```go

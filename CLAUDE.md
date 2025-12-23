@@ -310,12 +310,6 @@ func Run(t *testing.T, fn func(ctx *Context))
 func RunWithConfig(t *testing.T, cfg Config, fn func(ctx *Context))
 ```
 
-### Helm
-
-```go
-func FromHelm(chartPath, releaseName string, values map[string]interface{}) ([]runtime.Object, error)
-```
-
 ---
 
 ## USE CASES
