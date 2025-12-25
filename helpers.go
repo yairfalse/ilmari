@@ -35,7 +35,7 @@ func (c *Context) Logs(pod string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	buf := new(strings.Builder)
 	if _, err = io.Copy(buf, stream); err != nil {
@@ -63,7 +63,7 @@ func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	buf := new(strings.Builder)
 	if _, err = io.Copy(buf, stream); err != nil {
@@ -88,7 +88,7 @@ func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 		if err != nil {
 			return
 		}
-		defer stream.Close()
+		defer func() { _ = stream.Close() }()
 
 		reader := bufio.NewReader(stream)
 		for {
@@ -297,7 +297,7 @@ func (c *Context) CopyFrom(pod, remotePath, localPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create local file: %w", err)
 	}
-	defer outFile.Close()
+	defer func() { _ = outFile.Close() }()
 
 	if _, err = io.CopyN(outFile, tr, hdr.Size); err != nil {
 		return fmt.Errorf("failed to write local file: %w", err)
@@ -368,7 +368,7 @@ func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (map[str
 
 		buf := new(strings.Builder)
 		_, copyErr := io.Copy(buf, stream)
-		stream.Close()
+		_ = stream.Close()
 		if copyErr != nil {
 			result[pod.Name] = fmt.Sprintf("[error reading: %v]", copyErr)
 			continue

@@ -51,9 +51,7 @@ type PodMetricsDetail struct {
 // Requires metrics-server to be installed in the cluster.
 func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 	// Handle "pod/name" format
-	if strings.HasPrefix(podName, "pod/") {
-		podName = strings.TrimPrefix(podName, "pod/")
-	}
+	podName = strings.TrimPrefix(podName, "pod/")
 
 	metricsClient, err := c.getMetricsClient()
 	if err != nil {
@@ -81,9 +79,7 @@ func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 // Requires metrics-server to be installed in the cluster.
 func (c *Context) MetricsDetail(podName string) (*PodMetricsDetail, error) {
 	// Handle "pod/name" format
-	if strings.HasPrefix(podName, "pod/") {
-		podName = strings.TrimPrefix(podName, "pod/")
-	}
+	podName = strings.TrimPrefix(podName, "pod/")
 
 	metricsClient, err := c.getMetricsClient()
 	if err != nil {

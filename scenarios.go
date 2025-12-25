@@ -231,8 +231,8 @@ func (t *Traffic) run() {
 		t.mu.Unlock()
 
 		if resp != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
 	}
 }

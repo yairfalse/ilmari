@@ -72,7 +72,7 @@ func TestForwardMakesHTTPRequest(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != 200 {
 			t.Errorf("expected 200, got %d", resp.StatusCode)
@@ -106,7 +106,7 @@ func TestPortForwardPost(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Post failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// nginx returns 405 for POST to static resources - this proves POST was sent
 		if resp.StatusCode != 405 {
@@ -141,7 +141,7 @@ func TestPortForwardPut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Put failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// nginx returns 405 for PUT - proves the method was sent correctly
 		if resp.StatusCode != 405 {
@@ -176,7 +176,7 @@ func TestPortForwardDelete(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Delete failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// nginx returns 405 for DELETE - proves the method was sent correctly
 		if resp.StatusCode != 405 {
@@ -217,7 +217,7 @@ func TestPortForwardDo(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Do failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		// nginx returns 405 for PATCH - proves the method was sent correctly
 		if resp.StatusCode != 405 {
@@ -281,7 +281,7 @@ func TestPortForwardGetVerify(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != 200 {
 			t.Errorf("expected 200, got %d", resp.StatusCode)

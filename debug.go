@@ -74,12 +74,12 @@ func (c *Context) debugDeployment(name string, opts DebugOptions) error {
 	}
 
 	// Header
-	fmt.Fprintf(w, "=== deployment/%s ===\n", name)
+	_, _ = fmt.Fprintf(w, "=== deployment/%s ===\n", name)
 	desired := int32(1)
 	if deploy.Spec.Replicas != nil {
 		desired = *deploy.Spec.Replicas
 	}
-	fmt.Fprintf(w, "Status: %d/%d ready\n", deploy.Status.ReadyReplicas, desired)
+	_, _ = fmt.Fprintf(w, "Status: %d/%d ready\n", deploy.Status.ReadyReplicas, desired)
 	printConditions(w, deploymentConditionsToGeneric(deploy.Status.Conditions))
 
 	// Get pods
@@ -102,12 +102,12 @@ func (c *Context) debugStatefulSet(name string, opts DebugOptions) error {
 	}
 
 	// Header
-	fmt.Fprintf(w, "=== statefulset/%s ===\n", name)
+	_, _ = fmt.Fprintf(w, "=== statefulset/%s ===\n", name)
 	desired := int32(1)
 	if ss.Spec.Replicas != nil {
 		desired = *ss.Spec.Replicas
 	}
-	fmt.Fprintf(w, "Status: %d/%d ready\n", ss.Status.ReadyReplicas, desired)
+	_, _ = fmt.Fprintf(w, "Status: %d/%d ready\n", ss.Status.ReadyReplicas, desired)
 
 	// Get pods
 	pods, err := c.getPodsForSelector(ss.Spec.Selector.MatchLabels)
@@ -129,8 +129,8 @@ func (c *Context) debugDaemonSet(name string, opts DebugOptions) error {
 	}
 
 	// Header
-	fmt.Fprintf(w, "=== daemonset/%s ===\n", name)
-	fmt.Fprintf(w, "Status: %d/%d ready\n", ds.Status.NumberReady, ds.Status.DesiredNumberScheduled)
+	_, _ = fmt.Fprintf(w, "=== daemonset/%s ===\n", name)
+	_, _ = fmt.Fprintf(w, "Status: %d/%d ready\n", ds.Status.NumberReady, ds.Status.DesiredNumberScheduled)
 
 	// Get pods
 	pods, err := c.getPodsForSelector(ds.Spec.Selector.MatchLabels)
@@ -157,8 +157,8 @@ func (c *Context) debugPod(name string, opts DebugOptions) error {
 
 func (c *Context) debugPods(w io.Writer, pods []corev1.Pod, opts DebugOptions) {
 	if len(pods) == 0 {
-		fmt.Fprintln(w, "\n=== Pods ===")
-		fmt.Fprintln(w, "(no pods found)")
+		_, _ = fmt.Fprintln(w, "\n=== Pods ===")
+		_, _ = fmt.Fprintln(w, "(no pods found)")
 		return
 	}
 
@@ -168,14 +168,14 @@ func (c *Context) debugPods(w io.Writer, pods []corev1.Pod, opts DebugOptions) {
 	})
 
 	// Print pod status
-	fmt.Fprintln(w, "\n=== Pods ===")
+	_, _ = fmt.Fprintln(w, "\n=== Pods ===")
 	for _, pod := range pods {
 		status := string(pod.Status.Phase)
 		restarts := int32(0)
 		for _, cs := range pod.Status.ContainerStatuses {
 			restarts += cs.RestartCount
 		}
-		fmt.Fprintf(w, "%s: %s (%d restarts)\n", pod.Name, status, restarts)
+		_, _ = fmt.Fprintf(w, "%s: %s (%d restarts)\n", pod.Name, status, restarts)
 	}
 
 	// Print events if enabled
@@ -200,7 +200,7 @@ func (c *Context) debugEvents(w io.Writer, pods []corev1.Pod) {
 
 	events, err := c.Client.CoreV1().Events(c.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		fmt.Fprintf(w, "\n=== Events ===\n(error fetching events: %v)\n", err)
+		_, _ = fmt.Fprintf(w, "\n=== Events ===\n(error fetching events: %v)\n", err)
 		return
 	}
 
@@ -213,8 +213,8 @@ func (c *Context) debugEvents(w io.Writer, pods []corev1.Pod) {
 	}
 
 	if len(relevant) == 0 {
-		fmt.Fprintln(w, "\n=== Events ===")
-		fmt.Fprintln(w, "(no events)")
+		_, _ = fmt.Fprintln(w, "\n=== Events ===")
+		_, _ = fmt.Fprintln(w, "(no events)")
 		return
 	}
 
@@ -236,42 +236,42 @@ func (c *Context) debugEvents(w io.Writer, pods []corev1.Pod) {
 		relevant = relevant[len(relevant)-10:]
 	}
 
-	fmt.Fprintln(w, "\n=== Events ===")
+	_, _ = fmt.Fprintln(w, "\n=== Events ===")
 	for _, ev := range relevant {
 		ts := ev.LastTimestamp.Time
 		if ts.IsZero() {
 			ts = ev.EventTime.Time
 		}
 		age := formatAge(ts)
-		fmt.Fprintf(w, "%s %s: %s\n", age, ev.Reason, ev.Message)
+		_, _ = fmt.Fprintf(w, "%s %s: %s\n", age, ev.Reason, ev.Message)
 	}
 }
 
 func (c *Context) debugLogs(w io.Writer, pods []corev1.Pod, tailLines int64) {
-	fmt.Fprintf(w, "\n=== Logs (last %d lines) ===\n", tailLines)
+	_, _ = fmt.Fprintf(w, "\n=== Logs (last %d lines) ===\n", tailLines)
 
 	for _, pod := range pods {
 		// Skip non-running pods
 		if pod.Status.Phase != corev1.PodRunning {
-			fmt.Fprintf(w, "[%s] (pod not running: %s)\n", pod.Name, pod.Status.Phase)
+			_, _ = fmt.Fprintf(w, "[%s] (pod not running: %s)\n", pod.Name, pod.Status.Phase)
 			continue
 		}
 
 		logs, err := c.LogsWithOptions(pod.Name, LogsOptions{TailLines: tailLines})
 		if err != nil {
-			fmt.Fprintf(w, "[%s] (error: %v)\n", pod.Name, err)
+			_, _ = fmt.Fprintf(w, "[%s] (error: %v)\n", pod.Name, err)
 			continue
 		}
 
 		if logs == "" {
-			fmt.Fprintf(w, "[%s] (no logs)\n", pod.Name)
+			_, _ = fmt.Fprintf(w, "[%s] (no logs)\n", pod.Name)
 			continue
 		}
 
 		// Prefix each line with pod name
 		lines := strings.Split(strings.TrimSuffix(logs, "\n"), "\n")
 		for _, line := range lines {
-			fmt.Fprintf(w, "[%s] %s\n", pod.Name, line)
+			_, _ = fmt.Fprintf(w, "[%s] %s\n", pod.Name, line)
 		}
 	}
 }
@@ -313,7 +313,7 @@ func deploymentConditionsToGeneric(conditions []appsv1.DeploymentCondition) []ge
 func printConditions(w io.Writer, conditions []genericCondition) {
 	for _, c := range conditions {
 		if c.Status != "True" {
-			fmt.Fprintf(w, "Condition %s: %s (%s)\n", c.Type, c.Status, c.Message)
+			_, _ = fmt.Fprintf(w, "Condition %s: %s (%s)\n", c.Type, c.Status, c.Message)
 		}
 	}
 }

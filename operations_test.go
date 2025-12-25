@@ -65,7 +65,9 @@ func TestRestartTriggersRollingUpdate(t *testing.T) {
 
 		// Get original annotation
 		var before appsv1.Deployment
-		ctx.Get("restart-test", &before)
+		if err := ctx.Get("restart-test", &before); err != nil {
+			t.Fatalf("Get before failed: %v", err)
+		}
 		beforeAnnotations := before.Spec.Template.Annotations
 
 		// Restart
@@ -75,7 +77,9 @@ func TestRestartTriggersRollingUpdate(t *testing.T) {
 
 		// Verify restart annotation was added
 		var after appsv1.Deployment
-		ctx.Get("restart-test", &after)
+		if err := ctx.Get("restart-test", &after); err != nil {
+			t.Fatalf("Get after failed: %v", err)
+		}
 
 		restartAt := after.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"]
 		if restartAt == "" {
@@ -128,7 +132,9 @@ func TestRollbackToRevision(t *testing.T) {
 
 		// Verify image is back to v1
 		var after appsv1.Deployment
-		ctx.Get("rollback-test", &after)
+		if err := ctx.Get("rollback-test", &after); err != nil {
+			t.Fatalf("Get after rollback failed: %v", err)
+		}
 
 		image := after.Spec.Template.Spec.Containers[0].Image
 		if image != "nginx:1.24" {

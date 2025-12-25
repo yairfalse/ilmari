@@ -483,10 +483,10 @@ func TestSecretFromEnv(t *testing.T) {
 
 	Run(t, func(ctx *Context) {
 		// Set env vars
-		os.Setenv("TEST_SECRET_USER", "admin")
-		os.Setenv("TEST_SECRET_PASS", "secret123")
-		defer os.Unsetenv("TEST_SECRET_USER")
-		defer os.Unsetenv("TEST_SECRET_PASS")
+		_ = os.Setenv("TEST_SECRET_USER", "admin")
+		_ = os.Setenv("TEST_SECRET_PASS", "secret123")
+		defer func() { _ = os.Unsetenv("TEST_SECRET_USER") }()
+		defer func() { _ = os.Unsetenv("TEST_SECRET_PASS") }()
 
 		// Create secret from env
 		err := ctx.SecretFromEnv("env-secret", "TEST_SECRET_USER", "TEST_SECRET_PASS")

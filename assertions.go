@@ -508,6 +508,7 @@ func (a *PVCAssertion) HasAnnotation(key, value string) *PVCAssertion {
 	}
 	return a
 }
+
 // Error returns any assertion error.
 func (a *PVCAssertion) Error() error {
 	return a.err
@@ -544,7 +545,7 @@ func (a *PodAssertion) Exists() *PodAssertion {
 	_, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
 		context.Background(), a.name, metav1.GetOptions{})
 	if err != nil {
-		a.err = fmt.Errorf("Pod %s does not exist: %w", a.name, err)
+		a.err = fmt.Errorf("pod %s does not exist: %w", a.name, err)
 	}
 	return a
 }
@@ -565,7 +566,7 @@ func (a *PodAssertion) IsReady() *PodAssertion {
 			return a
 		}
 	}
-	a.err = fmt.Errorf("Pod %s is not ready", a.name)
+	a.err = fmt.Errorf("pod %s is not ready", a.name)
 	return a
 }
 
@@ -582,7 +583,7 @@ func (a *PodAssertion) HasNoRestarts() *PodAssertion {
 	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.RestartCount > 0 {
-			a.err = fmt.Errorf("Pod %s: container %s has %d restarts", a.name, cs.Name, cs.RestartCount)
+			a.err = fmt.Errorf("pod %s: container %s has %d restarts", a.name, cs.Name, cs.RestartCount)
 			return a
 		}
 	}
@@ -603,11 +604,11 @@ func (a *PodAssertion) NoOOMKills() *PodAssertion {
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.LastTerminationState.Terminated != nil &&
 			cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
-			a.err = fmt.Errorf("Pod %s: container %s was OOMKilled", a.name, cs.Name)
+			a.err = fmt.Errorf("pod %s: container %s was OOMKilled", a.name, cs.Name)
 			return a
 		}
 		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
-			a.err = fmt.Errorf("Pod %s: container %s was OOMKilled", a.name, cs.Name)
+			a.err = fmt.Errorf("pod %s: container %s was OOMKilled", a.name, cs.Name)
 			return a
 		}
 	}
@@ -625,7 +626,7 @@ func (a *PodAssertion) LogsContain(text string) *PodAssertion {
 		return a
 	}
 	if !strings.Contains(logs, text) {
-		a.err = fmt.Errorf("Pod %s: logs do not contain %q", a.name, text)
+		a.err = fmt.Errorf("pod %s: logs do not contain %q", a.name, text)
 	}
 	return a
 }
@@ -642,7 +643,7 @@ func (a *PodAssertion) HasLabel(key, value string) *PodAssertion {
 		return a
 	}
 	if pod.Labels[key] != value {
-		a.err = fmt.Errorf("Pod %s: expected label %s=%s, got %s=%s", a.name, key, value, key, pod.Labels[key])
+		a.err = fmt.Errorf("pod %s: expected label %s=%s, got %s=%s", a.name, key, value, key, pod.Labels[key])
 	}
 	return a
 }
@@ -659,7 +660,7 @@ func (a *PodAssertion) HasAnnotation(key, value string) *PodAssertion {
 		return a
 	}
 	if pod.Annotations[key] != value {
-		a.err = fmt.Errorf("Pod %s: expected annotation %s=%s, got %s=%s", a.name, key, value, key, pod.Annotations[key])
+		a.err = fmt.Errorf("pod %s: expected annotation %s=%s, got %s=%s", a.name, key, value, key, pod.Annotations[key])
 	}
 	return a
 }
@@ -1034,6 +1035,7 @@ func (a *StatefulSetAssertion) HasAnnotation(key, value string) *StatefulSetAsse
 	}
 	return a
 }
+
 // Error returns any assertion error.
 func (a *StatefulSetAssertion) Error() error {
 	return a.err
@@ -1097,11 +1099,9 @@ func (e *EventuallyBuilder) Wait() error {
 			return fmt.Errorf("condition not met within %v", e.timeout)
 		}
 
-		select {
-		case <-ticker.C:
-			if e.fn() {
-				return nil
-			}
+		<-ticker.C
+		if e.fn() {
+			return nil
 		}
 	}
 }
@@ -1147,15 +1147,13 @@ func (c *ConsistentlyBuilder) Wait() error {
 		return fmt.Errorf("condition was false at start")
 	}
 
-	for {
-		select {
-		case <-ticker.C:
-			if !c.fn() {
-				return fmt.Errorf("condition became false after %v", time.Since(deadline.Add(-c.duration)))
-			}
-			if time.Now().After(deadline) {
-				return nil // success - condition stayed true
-			}
+	for range ticker.C {
+		if !c.fn() {
+			return fmt.Errorf("condition became false after %v", time.Since(deadline.Add(-c.duration)))
+		}
+		if time.Now().After(deadline) {
+			return nil // success - condition stayed true
 		}
 	}
+	return nil
 }

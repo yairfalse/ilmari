@@ -280,11 +280,11 @@ func TestFormatMemory(t *testing.T) {
 		bytes    int64
 		contains string // Check contains since exact format may vary
 	}{
-		{1024, "Ki"},           // 1Ki
-		{1048576, "Mi"},        // 1Mi
-		{1073741824, "Gi"},     // 1Gi
-		{536870912, "512Mi"},   // 512Mi
-		{268435456, "256Mi"},   // 256Mi
+		{1024, "Ki"},         // 1Ki
+		{1048576, "Mi"},      // 1Mi
+		{1073741824, "Gi"},   // 1Gi
+		{536870912, "512Mi"}, // 512Mi
+		{268435456, "256Mi"}, // 256Mi
 	}
 
 	for _, tt := range tests {
