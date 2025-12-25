@@ -1,6 +1,7 @@
 package ilmari
 
 import (
+	"fmt"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -120,13 +121,13 @@ func TestListDynamic(t *testing.T) {
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
 				"metadata": map[string]interface{}{
-					"name": "list-test-" + string(rune('a'+i)),
+					"name": fmt.Sprintf("list-test-%c", 'a'+i),
 					"labels": map[string]interface{}{
 						"test-group": "list-dynamic",
 					},
 				},
 				"data": map[string]interface{}{
-					"index": string(rune('0' + i)),
+					"index": fmt.Sprintf("%d", i),
 				},
 			}
 

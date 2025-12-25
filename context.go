@@ -856,48 +856,51 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 				}
 				if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
 					ps.Reason = cs.State.Waiting.Reason
-					// Add hints for common issues
-					switch {
-					case strings.Contains(ps.Reason, "ImagePullBackOff"), strings.Contains(ps.Reason, "ErrImagePull"):
-						imageName := "<unknown>"
-						if len(pod.Spec.Containers) > 0 {
-							imageName = pod.Spec.Containers[0].Image
+					// Add hints for common issues (only set if not already set)
+					if waitErr.Hint == "" {
+						switch {
+						case strings.Contains(ps.Reason, "ImagePullBackOff"), strings.Contains(ps.Reason, "ErrImagePull"):
+							imageName := "<unknown>"
+							if len(pod.Spec.Containers) > 0 {
+								imageName = pod.Spec.Containers[0].Image
+							}
+							waitErr.Hint = fmt.Sprintf("Image %q failed to pull.\n"+
+								"  → Verify the image exists: docker pull %s\n"+
+								"  → Check for typos in the image name/tag\n"+
+								"  → For private registries, ensure imagePullSecrets is configured", imageName, imageName)
+						case ps.Reason == "CrashLoopBackOff":
+							waitErr.Hint = "Container is crash-looping.\n" +
+								"  → Check logs: ctx.Logs(\"" + pod.Name + "\")\n" +
+								"  → Common causes: missing env vars, failed health checks, app errors"
+						case ps.Reason == "CreateContainerConfigError":
+							waitErr.Hint = "Container configuration error.\n" +
+								"  → Check if referenced ConfigMaps/Secrets exist\n" +
+								"  → Verify volume mounts are correct"
+						case ps.Reason == "ContainerCreating":
+							waitErr.Hint = "Container is still being created.\n" +
+								"  → May be pulling a large image\n" +
+								"  → Check if PVCs are bound: ctx.WaitPVCBound()"
+						case ps.Reason == "PodInitializing":
+							waitErr.Hint = "Init containers are still running.\n" +
+								"  → Check init container logs for progress"
 						}
-						waitErr.Hint = fmt.Sprintf("Image %q failed to pull.\n"+
-							"  → Verify the image exists: docker pull %s\n"+
-							"  → Check for typos in the image name/tag\n"+
-							"  → For private registries, ensure imagePullSecrets is configured", imageName, imageName)
-					case ps.Reason == "CrashLoopBackOff":
-						waitErr.Hint = "Container is crash-looping.\n" +
-							"  → Check logs: ctx.Logs(\"" + pod.Name + "\")\n" +
-							"  → Common causes: missing env vars, failed health checks, app errors"
-					case ps.Reason == "CreateContainerConfigError":
-						waitErr.Hint = "Container configuration error.\n" +
-							"  → Check if referenced ConfigMaps/Secrets exist\n" +
-							"  → Verify volume mounts are correct"
-					case ps.Reason == "ContainerCreating":
-						waitErr.Hint = "Container is still being created.\n" +
-							"  → May be pulling a large image\n" +
-							"  → Check if PVCs are bound: ctx.WaitPVCBound()"
-					case ps.Reason == "PodInitializing":
-						waitErr.Hint = "Init containers are still running.\n" +
-							"  → Check init container logs for progress"
 					}
 				}
 				if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
 					if ps.Reason == "" {
 						ps.Reason = cs.State.Terminated.Reason
 					}
-					if cs.State.Terminated.Reason == "OOMKilled" {
-						waitErr.Hint = "Container was killed due to Out of Memory.\n" +
-							"  → Increase memory limits in resource requests\n" +
-							"  → Check for memory leaks in the application"
-					}
-					if cs.State.Terminated.ExitCode != 0 {
-						waitErr.Hint = fmt.Sprintf("Container exited with code %d.\n"+
-							"  → Check logs: ctx.Logs(\"%s\")\n"+
-							"  → Exit code 1: general error, 137: OOM/SIGKILL, 143: SIGTERM",
-							cs.State.Terminated.ExitCode, pod.Name)
+					if waitErr.Hint == "" {
+						if cs.State.Terminated.Reason == "OOMKilled" {
+							waitErr.Hint = "Container was killed due to Out of Memory.\n" +
+								"  → Increase memory limits in resource requests\n" +
+								"  → Check for memory leaks in the application"
+						} else if cs.State.Terminated.ExitCode != 0 {
+							waitErr.Hint = fmt.Sprintf("Container exited with code %d.\n"+
+								"  → Check logs: ctx.Logs(\"%s\")\n"+
+								"  → Exit code 1: general error, 137: OOM/SIGKILL, 143: SIGTERM",
+								cs.State.Terminated.ExitCode, pod.Name)
+						}
 					}
 				}
 			}

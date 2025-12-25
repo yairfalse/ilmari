@@ -22,7 +22,7 @@ func TestWatchReceivesEvents(t *testing.T) {
 		var doneOnce sync.Once
 
 		// Start watching ConfigMaps
-		stop := ctx.Watch("configmap", func(event WatchEvent) {
+		stop, err := ctx.Watch("configmap", func(event WatchEvent) {
 			mu.Lock()
 			events = append(events, event)
 			eventCount := len(events)
@@ -31,6 +31,9 @@ func TestWatchReceivesEvents(t *testing.T) {
 				doneOnce.Do(func() { close(done) })
 			}
 		})
+		if err != nil {
+			t.Fatalf("Watch failed: %v", err)
+		}
 		defer stop()
 
 		// Give watch time to establish before creating resources

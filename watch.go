@@ -24,65 +24,68 @@ type WatchEvent struct {
 }
 
 // Watch starts watching resources of the given kind.
-// Returns a stop function to cancel the watch. Safe to call multiple times.
+// Returns a stop function to cancel the watch and an error if the watch couldn't start.
+// The stop function is safe to call multiple times.
 // The callback is invoked for each event (ADDED, MODIFIED, DELETED).
-func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
+func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) {
+	ctx := context.Background()
+	kind = strings.ToLower(kind)
+
+	// Map of kind to watcher factory functions
+	watcherFactories := map[string]func(ctx context.Context, c *Context) (watch.Interface, error){
+		"pod": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+		"deployment": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+		"configmap": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+		"secret": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+		"service": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+		"statefulset": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+		"daemonset": func(ctx context.Context, c *Context) (watch.Interface, error) {
+			return c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
+		},
+	}
+
+	factory, ok := watcherFactories[kind]
+	if !ok {
+		return nil, &UnsupportedKindError{
+			Operation:      "Watch",
+			Kind:           kind,
+			SupportedKinds: []string{"pod", "deployment", "configmap", "secret", "service", "statefulset", "daemonset"},
+		}
+	}
+
+	watcher, err := factory(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+
 	stopChan := make(chan struct{})
 	var stopOnce sync.Once
 
+	// Use a buffered channel to decouple event delivery from callback execution.
+	eventChan := make(chan WatchEvent, 100)
+
+	// Goroutine to invoke the callback for each event.
 	go func() {
-		ctx := context.Background()
-		kind = strings.ToLower(kind)
-
-		var watcher watch.Interface
-		var err error
-
-		// Map of kind to watcher factory functions
-		watcherFactories := map[string]func(ctx context.Context, c *Context) (watch.Interface, error){
-			"pod": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
-			"deployment": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
-			"configmap": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
-			"secret": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
-			"service": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
-			"statefulset": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
-			"daemonset": func(ctx context.Context, c *Context) (watch.Interface, error) {
-				return c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-			},
+		for evt := range eventChan {
+			callback(evt)
 		}
+	}()
 
-		factory, ok := watcherFactories[kind]
-		if !ok {
-			return // unsupported kind
-		}
-		watcher, err = factory(ctx, c)
-
-		if err != nil {
-			return
-		}
+	// Goroutine to process watch events.
+	go func() {
 		defer watcher.Stop()
-
-		// Use a buffered channel to decouple event delivery from callback execution.
-		eventChan := make(chan WatchEvent, 100)
-
-		// Goroutine to invoke the callback for each event.
-		go func() {
-			for evt := range eventChan {
-				callback(evt)
-			}
-		}()
-
 		for {
 			select {
 			case <-stopChan:
@@ -101,7 +104,7 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 				select {
 				case eventChan <- evt:
 				default:
-					// Optionally log or handle dropped events here.
+					// Event dropped - buffer full.
 				}
 			}
 		}
@@ -111,7 +114,7 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) func() {
 		stopOnce.Do(func() {
 			close(stopChan)
 		})
-	}
+	}, nil
 }
 
 // WaitDeleted waits for a resource to be deleted.
