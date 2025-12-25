@@ -287,7 +287,7 @@ func (c *Context) TestIngress(name string) *IngressTest
 
 ---
 
-#### `dynamic.go` (~250 lines) - CRDs and Helm
+#### `dynamic.go` (~200 lines) - CRDs
 ```go
 // Dynamic client operations for CRDs and unstructured resources
 
@@ -301,9 +301,6 @@ func (c *Context) ListDynamic(gvr schema.GroupVersionResource) ([]map[string]int
 // NEW: Cluster-scoped dynamic operations
 func (c *Context) ApplyDynamicCluster(gvr schema.GroupVersionResource, obj map[string]interface{}) error
 func (c *Context) GetDynamicCluster(gvr schema.GroupVersionResource, name string) (map[string]interface{}, error)
-
-// Helm
-func FromHelm(chartPath, releaseName string, values map[string]interface{}) ([]runtime.Object, error)
 ```
 
 **Rationale:** Dynamic client is a different API than typed client. CRD users need this, but most users don't. Keeps complexity isolated.

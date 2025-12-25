@@ -22,9 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
 
 // ============================================================================
@@ -32,45 +29,23 @@ import (
 // ============================================================================
 
 // Logs retrieves logs from a pod.
-func (c *Context) Logs(pod string) (result string, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Logs",
-		attribute.String("pod", pod))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Logs(pod string) (string, error) {
 	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{})
 	stream, err := req.Stream(context.Background())
 	if err != nil {
-		err = fmt.Errorf("failed to get logs: %w", err)
-		return "", err
+		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
 	defer stream.Close()
 
 	buf := new(strings.Builder)
 	if _, err = io.Copy(buf, stream); err != nil {
-		err = fmt.Errorf("failed to read logs: %w", err)
-		return "", err
+		return "", fmt.Errorf("failed to read logs: %w", err)
 	}
 	return buf.String(), nil
 }
 
 // LogsWithOptions retrieves logs from a pod with options.
-func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (result string, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.LogsWithOptions",
-		attribute.String("pod", pod))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (string, error) {
 	logOpts := &corev1.PodLogOptions{}
 	if opts.Container != "" {
 		logOpts.Container = opts.Container
@@ -86,15 +61,13 @@ func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (result string, 
 	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, logOpts)
 	stream, err := req.Stream(context.Background())
 	if err != nil {
-		err = fmt.Errorf("failed to get logs: %w", err)
-		return "", err
+		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
 	defer stream.Close()
 
 	buf := new(strings.Builder)
 	if _, err = io.Copy(buf, stream); err != nil {
-		err = fmt.Errorf("failed to read logs: %w", err)
-		return "", err
+		return "", fmt.Errorf("failed to read logs: %w", err)
 	}
 	return buf.String(), nil
 }
@@ -103,22 +76,16 @@ func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (result string, 
 // Returns a stop function to cancel the stream. Safe to call multiple times.
 // Each line is passed to the callback as it arrives.
 func (c *Context) LogsStream(pod string, callback func(line string)) func() {
-	_, span := c.startSpan(context.Background(), "ilmari.LogsStream",
-		attribute.String("pod", pod))
-
 	stopChan := make(chan struct{})
 	var stopOnce sync.Once
 
 	go func() {
-		defer span.End()
-
 		req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{
 			Follow: true,
 		})
 
 		stream, err := req.Stream(context.Background())
 		if err != nil {
-			span.RecordError(err)
 			return
 		}
 		defer stream.Close()
@@ -131,9 +98,6 @@ func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 			default:
 				line, err := reader.ReadString('\n')
 				if err != nil {
-					if err != io.EOF {
-						span.RecordError(err)
-					}
 					return
 				}
 				callback(strings.TrimSuffix(line, "\n"))
@@ -149,20 +113,10 @@ func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 }
 
 // Events returns all events in the test namespace.
-func (c *Context) Events() (events []corev1.Event, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Events")
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Events() ([]corev1.Event, error) {
 	list, err := c.Client.CoreV1().Events(c.Namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		err = fmt.Errorf("failed to list events: %w", err)
-		return nil, err
+		return nil, fmt.Errorf("failed to list events: %w", err)
 	}
 	return list.Items, nil
 }
@@ -172,28 +126,15 @@ func (c *Context) Events() (events []corev1.Event, err error) {
 // ============================================================================
 
 // Exec executes a command in a pod.
-func (c *Context) Exec(pod string, cmd []string) (result string, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.Exec",
-		attribute.String("pod", pod),
-		attribute.StringSlice("command", cmd))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) Exec(pod string, cmd []string) (string, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		err = fmt.Errorf("failed to get config: %w", err)
-		return "", err
+		return "", fmt.Errorf("failed to get config: %w", err)
 	}
 
 	scheme := runtime.NewScheme()
 	if err = corev1.AddToScheme(scheme); err != nil {
-		err = fmt.Errorf("failed to add scheme: %w", err)
-		return "", err
+		return "", fmt.Errorf("failed to add scheme: %w", err)
 	}
 
 	req := c.Client.CoreV1().RESTClient().Post().
@@ -228,19 +169,7 @@ func (c *Context) Exec(pod string, cmd []string) (result string, err error) {
 
 // CopyTo copies a local file to a pod.
 // Uses tar to transfer the file via exec.
-func (c *Context) CopyTo(pod, localPath, remotePath string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.CopyTo",
-		attribute.String("pod", pod),
-		attribute.String("local", localPath),
-		attribute.String("remote", remotePath))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) CopyTo(pod, localPath, remotePath string) error {
 	// Read local file
 	data, err := os.ReadFile(localPath)
 	if err != nil {
@@ -315,19 +244,7 @@ func (c *Context) CopyTo(pod, localPath, remotePath string) (err error) {
 
 // CopyFrom copies a file from a pod to a local path.
 // Uses tar to transfer the file via exec.
-func (c *Context) CopyFrom(pod, remotePath, localPath string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.CopyFrom",
-		attribute.String("pod", pod),
-		attribute.String("remote", remotePath),
-		attribute.String("local", localPath))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) CopyFrom(pod, remotePath, localPath string) error {
 	// Get config for exec
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
@@ -417,17 +334,7 @@ func (c *Context) LogsAll(selector string) (map[string]string, error) {
 // rather than failing the entire operation. This allows collecting logs from healthy pods
 // even when some pods are failing. The function only returns an error for selector/listing
 // failures. Check individual values for "[error" prefix to detect per-pod failures.
-func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (result map[string]string, err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.LogsAll",
-		attribute.String("selector", selector))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (map[string]string, error) {
 	// List pods matching selector
 	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: selector,
@@ -436,7 +343,7 @@ func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (result 
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	result = make(map[string]string)
+	result := make(map[string]string)
 
 	for _, pod := range pods.Items {
 		logOpts := &corev1.PodLogOptions{}
@@ -479,17 +386,7 @@ func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (result 
 
 // SecretFromFile creates a Secret from file contents.
 // The files map keys become the secret data keys, values are file paths.
-func (c *Context) SecretFromFile(name string, files map[string]string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.SecretFromFile",
-		attribute.String("name", name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) SecretFromFile(name string, files map[string]string) error {
 	data := make(map[string][]byte)
 	for key, path := range files {
 		content, readErr := os.ReadFile(path)
@@ -511,18 +408,7 @@ func (c *Context) SecretFromFile(name string, files map[string]string) (err erro
 
 // SecretFromEnv creates a Secret from environment variables.
 // Each key is looked up in the current process environment.
-func (c *Context) SecretFromEnv(name string, keys ...string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.SecretFromEnv",
-		attribute.String("name", name),
-		attribute.Int("key_count", len(keys)))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) SecretFromEnv(name string, keys ...string) error {
 	data := make(map[string][]byte)
 	for _, key := range keys {
 		value, ok := os.LookupEnv(key)
@@ -543,17 +429,7 @@ func (c *Context) SecretFromEnv(name string, keys ...string) (err error) {
 }
 
 // SecretTLS creates a TLS Secret from certificate and key files.
-func (c *Context) SecretTLS(name, certPath, keyPath string) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.SecretTLS",
-		attribute.String("name", name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) SecretTLS(name, certPath, keyPath string) error {
 	certData, err := os.ReadFile(certPath)
 	if err != nil {
 		return fmt.Errorf("failed to read certificate: %w", err)
@@ -589,18 +465,7 @@ func (c *Context) WaitPVCBound(resource string) error {
 }
 
 // WaitPVCBoundTimeout waits for a PVC to be bound with custom timeout.
-func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.WaitPVCBound",
-		attribute.String("resource", resource),
-		attribute.Int64("timeout_ms", timeout.Milliseconds()))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
+func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) error {
 	// Extract name (remove pvc/ prefix if present)
 	name := resource
 	if strings.HasPrefix(resource, "pvc/") {
@@ -896,24 +761,14 @@ func (r *RBACBuilder) Build() *RBACBundle {
 }
 
 // ApplyRBAC applies all resources in the RBACBundle.
-func (c *Context) ApplyRBAC(bundle *RBACBundle) (err error) {
-	_, span := c.startSpan(context.Background(), "ilmari.ApplyRBAC",
-		attribute.String("serviceaccount", bundle.ServiceAccount.Name))
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-		span.End()
-	}()
-
-	if err = c.Apply(bundle.ServiceAccount); err != nil {
+func (c *Context) ApplyRBAC(bundle *RBACBundle) error {
+	if err := c.Apply(bundle.ServiceAccount); err != nil {
 		return fmt.Errorf("failed to apply ServiceAccount: %w", err)
 	}
-	if err = c.Apply(bundle.Role); err != nil {
+	if err := c.Apply(bundle.Role); err != nil {
 		return fmt.Errorf("failed to apply Role: %w", err)
 	}
-	if err = c.Apply(bundle.RoleBinding); err != nil {
+	if err := c.Apply(bundle.RoleBinding); err != nil {
 		return fmt.Errorf("failed to apply RoleBinding: %w", err)
 	}
 

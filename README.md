@@ -1,6 +1,11 @@
-# Ilmari
+# ILMARI
 
-Go SDK for Kubernetes. Define infrastructure in code, not YAML.
+**Go SDK for Kubernetes. No YAML. No CLI. Just code.**
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.21%2B-blue.svg)](https://golang.org)
+
+**This is a learning project** - exploring Kubernetes SDK patterns in Go.
 
 ## Quick Start
 
@@ -266,20 +271,6 @@ stack := ilmari.NewStack().
 ctx.Up(stack)  // Deploys all, waits for ready
 ```
 
-### RBAC
-
-```go
-rbac := ilmari.ServiceAccount("my-sa").
-    WithRole("my-role").
-    CanGet("pods", "services").
-    CanList("deployments").
-    CanCreate("configmaps").
-    CanAll("secrets").  // get, list, watch, create, update, delete
-    Build()
-
-ctx.ApplyRBAC(rbac)
-```
-
 ## Secrets
 
 ```go
@@ -288,9 +279,6 @@ ctx.SecretFromFile("certs", map[string]string{
     "ca.crt":  "/path/to/ca.crt",
     "tls.crt": "/path/to/tls.crt",
 })
-
-// From environment
-ctx.SecretFromEnv("api-keys", "API_KEY", "API_SECRET")
 
 // TLS secret
 ctx.SecretTLS("my-tls", "cert.pem", "key.pem")
@@ -360,30 +348,6 @@ ctx.Assert("pod/api-xyz").
     Must()
 ```
 
-## Network Policy
-
-```go
-// Isolate pods (deny all ingress)
-ctx.Isolate(map[string]string{"app": "db"})
-
-// Allow specific traffic
-ctx.AllowFrom(
-    map[string]string{"app": "db"},      // target
-    map[string]string{"app": "api"},     // source
-)
-```
-
-## Ingress Testing
-
-```go
-ctx.TestIngress("my-ingress").
-    Host("api.example.com").
-    Path("/v1").
-    ExpectBackend("api-svc", 8080).
-    ExpectTLS("api-tls-secret").
-    Must()
-```
-
 ## Log Aggregation
 
 ```go
@@ -399,37 +363,6 @@ logs, _ := ctx.LogsAllWithOptions("app=myapp", ilmari.LogsOptions{
     Since:     5 * time.Minute,
     TailLines: 100,
 })
-```
-
-## YAML Loading
-
-```go
-// Single file
-ctx.LoadYAML("manifests/deploy.yaml")
-
-// Directory
-ctx.LoadYAMLDir("manifests/")
-
-// With overrides
-deploy, _ := ctx.LoadFixture("fixtures/base.yaml").
-    WithImage("myapp:test").
-    WithReplicas(1).
-    Build()
-```
-
-## Helm
-
-```go
-objects, _ := ilmari.FromHelm("./charts/myapp", "release-name", map[string]interface{}{
-    "replicaCount": 3,
-    "image": map[string]interface{}{
-        "tag": "v1.2.3",
-    },
-})
-
-for _, obj := range objects {
-    ctx.Apply(obj)
-}
 ```
 
 ## Test Scenarios
@@ -484,19 +417,6 @@ pod/myapp-xyz     ImagePullBackOff
   kubectl logs -n ilmari-test-a1b2c3 myapp-xyz
 ```
 
-## Tracing
-
-```go
-import "go.opentelemetry.io/otel"
-
-tp := initTracerProvider()  // Your OTEL setup
-ctx, _ := ilmari.NewContext(ilmari.WithTracerProvider(tp))
-
-// All operations are now traced
-ctx.Apply(deploy)      // Creates span: ilmari.Apply
-ctx.WaitReady("...")   // Creates span: ilmari.WaitReady
-```
-
 ## Dynamic Resources (CRDs)
 
 ```go
@@ -524,14 +444,15 @@ obj, _ := ctx.GetDynamic(gvr, "test")
 
 **Honest errors.** When something fails, you get real diagnostics—pod states, events, logs—not just "timeout waiting for resource".
 
-## Family
+## Naming
 
-| Language | Library | K8s Client |
-|----------|---------|------------|
-| Rust | [seppo](https://github.com/yairfalse/seppo) | kube-rs |
-| Go | **ilmari** | client-go |
-
-Seppo and Ilmari are smith gods from Finnish mythology (Kalevala). Same ideas, native implementations.
+**Ilmari** (Finnish smith god from Kalevala) - Part of a Finnish tool naming theme:
+- **SEPPO** (smith) - Kubernetes SDK for Rust
+- **ILMARI** (smith) - Kubernetes SDK for Go
+- **SYKLI** (cycle) - CI orchestrator
+- **NOPEA** (fast) - GitOps controller
+- **KULTA** (gold) - Progressive delivery
+- **RAUTA** (iron) - Gateway API controller
 
 ## Status
 

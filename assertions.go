@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -1084,11 +1082,6 @@ func (e *EventuallyBuilder) ProbeEvery(interval time.Duration) *EventuallyBuilde
 
 // Wait blocks until the condition is true or timeout is reached.
 func (e *EventuallyBuilder) Wait() error {
-	_, span := e.ctx.startSpan(context.Background(), "ilmari.Eventually",
-		attribute.Int64("timeout_ms", e.timeout.Milliseconds()),
-		attribute.Int64("interval_ms", e.interval.Milliseconds()))
-	defer span.End()
-
 	deadline := time.Now().Add(e.timeout)
 	ticker := time.NewTicker(e.interval)
 	defer ticker.Stop()
@@ -1101,10 +1094,7 @@ func (e *EventuallyBuilder) Wait() error {
 	for {
 		// Check deadline before waiting on ticker
 		if time.Now().After(deadline) {
-			err := fmt.Errorf("condition not met within %v", e.timeout)
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			return err
+			return fmt.Errorf("condition not met within %v", e.timeout)
 		}
 
 		select {
@@ -1148,31 +1138,20 @@ func (c *ConsistentlyBuilder) ProbeEvery(interval time.Duration) *ConsistentlyBu
 
 // Wait blocks and checks the condition repeatedly for the duration.
 func (c *ConsistentlyBuilder) Wait() error {
-	_, span := c.ctx.startSpan(context.Background(), "ilmari.Consistently",
-		attribute.Int64("duration_ms", c.duration.Milliseconds()),
-		attribute.Int64("interval_ms", c.interval.Milliseconds()))
-	defer span.End()
-
 	deadline := time.Now().Add(c.duration)
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
 	// Check immediately
 	if !c.fn() {
-		err := fmt.Errorf("condition was false at start")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return err
+		return fmt.Errorf("condition was false at start")
 	}
 
 	for {
 		select {
 		case <-ticker.C:
 			if !c.fn() {
-				err := fmt.Errorf("condition became false after %v", time.Since(deadline.Add(-c.duration)))
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return err
+				return fmt.Errorf("condition became false after %v", time.Since(deadline.Add(-c.duration)))
 			}
 			if time.Now().After(deadline) {
 				return nil // success - condition stayed true
