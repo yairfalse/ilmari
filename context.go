@@ -193,12 +193,15 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 		ctx.Namespace = fmt.Sprintf("%s-%s", options.isolatedPrefix, id)
 		ctx.ownsNamespace = true
 
-		// Create namespace
+		// Create namespace with labels for cleanup
 		ns := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: ctx.Namespace,
 				Labels: map[string]string{
-					"ilmari.io/managed": "true",
+					"ilmari.io/test": "true",
+				},
+				Annotations: map[string]string{
+					"ilmari.io/created-at": time.Now().Format(time.RFC3339),
 				},
 			},
 		}
@@ -293,12 +296,15 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 	id := uuid.New().String()[:8]
 	namespace := fmt.Sprintf("ilmari-test-%s", id)
 
-	// Create namespace
+	// Create namespace with creation timestamp for stale cleanup
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: namespace,
 			Labels: map[string]string{
 				"ilmari.io/test": "true",
+			},
+			Annotations: map[string]string{
+				"ilmari.io/created-at": time.Now().Format(time.RFC3339),
 			},
 		},
 	}
@@ -469,6 +475,78 @@ func (c *Context) cleanup() error {
 		c.t.Logf("Deleted test namespace: %s", c.Namespace)
 	}
 	return nil
+}
+
+// CleanupStaleNamespaces deletes ilmari test namespaces older than the given age.
+// This is useful for cleaning up namespaces left behind by failed tests.
+// Returns the number of namespaces deleted and any error.
+//
+// Example:
+//
+//	deleted, err := ilmari.CleanupStaleNamespaces(30 * time.Minute)
+func CleanupStaleNamespaces(maxAge time.Duration) (int, error) {
+	return CleanupStaleNamespacesWithKubeconfig("", maxAge)
+}
+
+// CleanupStaleNamespacesWithKubeconfig deletes stale namespaces using a specific kubeconfig.
+func CleanupStaleNamespacesWithKubeconfig(kubeconfig string, maxAge time.Duration) (int, error) {
+	// Load kubeconfig
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfig != "" {
+		loadingRules.ExplicitPath = kubeconfig
+	}
+
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return 0, fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	// List all ilmari test namespaces
+	namespaces, err := client.CoreV1().Namespaces().List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: "ilmari.io/test=true",
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	deleted := 0
+	cutoff := time.Now().Add(-maxAge)
+
+	for _, ns := range namespaces.Items {
+		// Check creation timestamp from annotation first (more accurate)
+		createdAt := ns.CreationTimestamp.Time
+		if ann, ok := ns.Annotations["ilmari.io/created-at"]; ok {
+			if parsed, err := time.Parse(time.RFC3339, ann); err == nil {
+				createdAt = parsed
+			}
+		}
+
+		if createdAt.Before(cutoff) {
+			err := client.CoreV1().Namespaces().Delete(
+				context.Background(),
+				ns.Name,
+				metav1.DeleteOptions{},
+			)
+			if err != nil {
+				// Log but continue - don't fail on individual namespace errors
+				continue
+			}
+			deleted++
+		}
+	}
+
+	return deleted, nil
 }
 
 // dumpDiagnostics prints diagnostic information on test failure.

@@ -515,3 +515,50 @@ func TestContextCloseKeepsSharedNamespace(t *testing.T) {
 		t.Errorf("default namespace should still exist: %v", err)
 	}
 }
+
+// TestCleanupStaleNamespaces verifies stale namespace cleanup.
+func TestCleanupStaleNamespaces(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	// Create a test namespace that will be "stale"
+	ctx, err := NewContext(WithIsolatedNamespace("stale-test"))
+	if err != nil {
+		t.Fatalf("NewContext failed: %v", err)
+	}
+	ns := ctx.Namespace
+
+	// Namespace exists
+	_, err = ctx.Client.CoreV1().Namespaces().Get(
+		context.Background(), ns, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Namespace should exist: %v", err)
+	}
+
+	// Cleanup with 0 age should delete it immediately
+	deleted, err := CleanupStaleNamespaces(0)
+	if err != nil {
+		t.Fatalf("CleanupStaleNamespaces failed: %v", err)
+	}
+
+	if deleted < 1 {
+		t.Errorf("Expected at least 1 namespace deleted, got %d", deleted)
+	}
+
+	// Wait for namespace to be deleted or terminating
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		nsObj, err := ctx.Client.CoreV1().Namespaces().Get(
+			context.Background(), ns, metav1.GetOptions{})
+		if err != nil {
+			// Namespace is gone - success
+			return
+		}
+		if nsObj.Status.Phase == corev1.NamespaceTerminating {
+			// Namespace is terminating - success
+			return
+		}
+	}
+	t.Errorf("Namespace %s should be deleted or terminating after 5s", ns)
+}
