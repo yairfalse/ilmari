@@ -54,6 +54,12 @@ func (pf *PortForward) URL(path string) string {
 	return fmt.Sprintf("http://localhost:%d%s", pf.localPort, path)
 }
 
+// Address returns the localhost:port address for the port forward.
+// Useful for gRPC connections that need a raw address.
+func (pf *PortForward) Address() string {
+	return fmt.Sprintf("localhost:%d", pf.localPort)
+}
+
 // Post makes an HTTP POST request through the port forward.
 // Caller is responsible for closing the response body.
 func (pf *PortForward) Post(path, contentType string, body io.Reader) (*http.Response, error) {
