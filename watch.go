@@ -7,10 +7,8 @@ import (
 	"sync"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/watch"
 )
 
 // ============================================================================
@@ -28,36 +26,11 @@ type WatchEvent struct {
 // The stop function is safe to call multiple times.
 // The callback is invoked for each event (ADDED, MODIFIED, DELETED).
 func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) {
-	ctx := context.Background()
+	ctx := c.goCtx
 	kind = strings.ToLower(kind)
 
-	// Map of kind to watcher factory functions
-	watcherFactories := map[string]func(ctx context.Context, c *Context) (watch.Interface, error){
-		"pod": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"deployment": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"configmap": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"secret": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"service": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"statefulset": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"daemonset": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-	}
-
-	factory, ok := watcherFactories[kind]
-	if !ok {
+	h := lookupHandler(kind)
+	if h == nil {
 		return nil, &UnsupportedKindError{
 			Operation:      "Watch",
 			Kind:           kind,
@@ -65,7 +38,7 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) 
 		}
 	}
 
-	watcher, err := factory(ctx, c)
+	watcher, err := h.Watch(ctx, c.Client, c.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -120,23 +93,23 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) 
 // WaitDeleted waits for a resource to be deleted.
 // Resource format: "kind/name" (e.g., "pod/myapp", "configmap/myconfig")
 func (c *Context) WaitDeleted(resource string) error {
-	return c.WaitDeletedTimeout(resource, 60*time.Second)
+	return c.WaitDeletedTimeout(resource, c.waitTimeout)
 }
 
 // WaitDeletedTimeout waits for a resource to be deleted with custom timeout.
 func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -158,64 +131,8 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) err
 
 // resourceExists checks if a resource exists.
 func (c *Context) resourceExists(kind, name string) (bool, error) {
-	ctx := context.Background()
-
-	type existsFunc func(ctx context.Context, c *Context, name string) (bool, error)
-
-	resourceFuncs := map[string]existsFunc{
-		"pod": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"deployment": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"configmap": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"secret": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"service": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"statefulset": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"daemonset": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-	}
-
-	if fn, ok := resourceFuncs[kind]; ok {
-		return fn(ctx, c, name)
+	if h := lookupHandler(kind); h != nil {
+		return h.Exists(c.goCtx, c.Client, c.Namespace, name)
 	}
 	return false, &UnsupportedKindError{
 		Operation:      "WaitDeleted",
@@ -239,13 +156,13 @@ const (
 // Patch applies a patch to a resource.
 // Resource format: "kind/name" (e.g., "deployment/myapp")
 func (c *Context) Patch(resource string, patch []byte, patchType PatchType) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	// Convert PatchType to Kubernetes patch type
 	var k8sPatchType types.PatchType
@@ -260,7 +177,7 @@ func (c *Context) Patch(resource string, patch []byte, patchType PatchType) erro
 		k8sPatchType = types.StrategicMergePatchType
 	}
 
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	patchFuncs := map[string]func() error{
 		"pod": func() error {

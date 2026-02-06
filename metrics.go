@@ -1,9 +1,7 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -51,7 +49,8 @@ type PodMetricsDetail struct {
 // Requires metrics-server to be installed in the cluster.
 func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 	// Handle "pod/name" format
-	podName = strings.TrimPrefix(podName, "pod/")
+	ref := ParseResourceRefWithDefault(podName, "pod")
+	podName = ref.Name
 
 	metricsClient, err := c.getMetricsClient()
 	if err != nil {
@@ -60,14 +59,14 @@ func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 
 	// Get pod metrics
 	podMetrics, err := metricsClient.MetricsV1beta1().PodMetricses(c.Namespace).Get(
-		context.Background(), podName, metav1.GetOptions{})
+		c.goCtx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get metrics for pod %s: %w", podName, err)
 	}
 
 	// Get pod spec to calculate percentages
 	pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(
-		context.Background(), podName, metav1.GetOptions{})
+		c.goCtx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pod %s: %w", podName, err)
 	}
@@ -79,7 +78,8 @@ func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 // Requires metrics-server to be installed in the cluster.
 func (c *Context) MetricsDetail(podName string) (*PodMetricsDetail, error) {
 	// Handle "pod/name" format
-	podName = strings.TrimPrefix(podName, "pod/")
+	ref := ParseResourceRefWithDefault(podName, "pod")
+	podName = ref.Name
 
 	metricsClient, err := c.getMetricsClient()
 	if err != nil {
@@ -88,14 +88,14 @@ func (c *Context) MetricsDetail(podName string) (*PodMetricsDetail, error) {
 
 	// Get pod metrics
 	podMetrics, err := metricsClient.MetricsV1beta1().PodMetricses(c.Namespace).Get(
-		context.Background(), podName, metav1.GetOptions{})
+		c.goCtx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get metrics for pod %s: %w", podName, err)
 	}
 
 	// Get pod spec to calculate percentages
 	pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(
-		context.Background(), podName, metav1.GetOptions{})
+		c.goCtx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pod %s: %w", podName, err)
 	}

@@ -1,12 +1,10 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,16 +26,19 @@ type SelfHealTest struct {
 
 // TestSelfHealing runs a self-healing test on a deployment.
 func (c *Context) TestSelfHealing(resource string, fn func(*SelfHealTest)) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
+	}
+	if ref.Kind != "deployment" {
 		return fmt.Errorf("TestSelfHealing requires deployment/name format")
 	}
 
 	test := &SelfHealTest{
 		ctx:             c,
 		resource:        resource,
-		deploymentName:  parts[1],
-		recoveryTimeout: 60 * time.Second,
+		deploymentName:  ref.Name,
+		recoveryTimeout: c.waitTimeout,
 	}
 
 	fn(test)
@@ -51,7 +52,7 @@ func (s *SelfHealTest) KillPod() {
 	}
 
 	// Find a pod from this deployment
-	pods, err := s.ctx.Client.CoreV1().Pods(s.ctx.Namespace).List(context.Background(), metav1.ListOptions{
+	pods, err := s.ctx.Client.CoreV1().Pods(s.ctx.Namespace).List(s.ctx.goCtx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("app=%s", s.deploymentName),
 	})
 	if err != nil {
@@ -88,15 +89,18 @@ type ScaleTest struct {
 
 // TestScaling runs a scaling test on a deployment.
 func (c *Context) TestScaling(resource string, fn func(*ScaleTest)) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
+	}
+	if ref.Kind != "deployment" {
 		return fmt.Errorf("TestScaling requires deployment/name format")
 	}
 
 	test := &ScaleTest{
 		ctx:            c,
 		resource:       resource,
-		deploymentName: parts[1],
+		deploymentName: ref.Name,
 	}
 
 	fn(test)
@@ -110,7 +114,7 @@ func (s *ScaleTest) ScaleTo(n int) {
 	}
 
 	deploy, err := s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Get(
-		context.Background(), s.deploymentName, metav1.GetOptions{})
+		s.ctx.goCtx, s.deploymentName, metav1.GetOptions{})
 	if err != nil {
 		s.err = fmt.Errorf("failed to get deployment: %w", err)
 		return
@@ -120,7 +124,7 @@ func (s *ScaleTest) ScaleTo(n int) {
 	deploy.Spec.Replicas = &replicas
 
 	_, err = s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Update(
-		context.Background(), deploy, metav1.UpdateOptions{})
+		s.ctx.goCtx, deploy, metav1.UpdateOptions{})
 	if err != nil {
 		s.err = fmt.Errorf("failed to scale deployment: %w", err)
 	}
@@ -132,7 +136,7 @@ func (s *ScaleTest) WaitStable() {
 		return
 	}
 
-	s.err = s.ctx.WaitReadyTimeout(s.resource, 60*time.Second)
+	s.err = s.ctx.WaitReadyTimeout(s.resource, s.ctx.waitTimeout)
 }
 
 // ============================================================================
@@ -147,18 +151,21 @@ type TrafficConfig struct {
 }
 
 // RPS sets the requests per second.
-func (t *TrafficConfig) RPS(n int) {
+func (t *TrafficConfig) RPS(n int) *TrafficConfig {
 	t.rps = n
+	return t
 }
 
 // Duration sets how long to generate traffic.
-func (t *TrafficConfig) Duration(d time.Duration) {
+func (t *TrafficConfig) Duration(d time.Duration) *TrafficConfig {
 	t.duration = d
+	return t
 }
 
 // Endpoint sets the HTTP endpoint to hit.
-func (t *TrafficConfig) Endpoint(path string) {
+func (t *TrafficConfig) Endpoint(path string) *TrafficConfig {
 	t.endpoint = path
+	return t
 }
 
 // Traffic represents an ongoing or completed traffic test.
@@ -174,7 +181,7 @@ type Traffic struct {
 }
 
 // StartTraffic starts generating HTTP traffic to a service.
-func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffic {
+func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) (*Traffic, error) {
 	config := TrafficConfig{
 		rps:      10,
 		duration: 10 * time.Second,
@@ -183,7 +190,10 @@ func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffi
 	fn(&config)
 
 	// Set up port forward
-	pf := c.PortForward(resource, 80)
+	pf, err := c.PortForward(resource, 80)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set up port forward: %w", err)
+	}
 
 	traffic := &Traffic{
 		ctx:       c,
@@ -196,17 +206,13 @@ func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffi
 	// Start traffic generation in background
 	go traffic.run()
 
-	return traffic
+	return traffic, nil
 }
 
 // run generates traffic in the background.
 func (t *Traffic) run() {
 	defer close(t.done)
 	defer t.pf.Close()
-
-	if t.pf.err != nil {
-		return
-	}
 
 	interval := time.Duration(float64(time.Second) / float64(t.config.rps))
 	ticker := time.NewTicker(interval)

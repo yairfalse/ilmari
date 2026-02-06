@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -11,6 +10,85 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// ============================================================================
+// Helpers to reduce assertion duplication
+// ============================================================================
+
+// objectLabels extracts labels from any Kubernetes object that implements ObjectMetaAccessor.
+func objectLabels(obj interface{}) (map[string]string, error) {
+	accessor, ok := obj.(metav1.ObjectMetaAccessor)
+	if !ok {
+		return nil, fmt.Errorf("object %T does not support metadata access", obj)
+	}
+	return accessor.GetObjectMeta().GetLabels(), nil
+}
+
+// objectAnnotations extracts annotations from any Kubernetes object that implements ObjectMetaAccessor.
+func objectAnnotations(obj interface{}) (map[string]string, error) {
+	accessor, ok := obj.(metav1.ObjectMetaAccessor)
+	if !ok {
+		return nil, fmt.Errorf("object %T does not support metadata access", obj)
+	}
+	return accessor.GetObjectMeta().GetAnnotations(), nil
+}
+
+// checkLabel checks that labels contain the expected key=value pair.
+func checkLabel(labels map[string]string, key, value, resourceDesc string) error {
+	if labels[key] != value {
+		return fmt.Errorf("%s: expected label %s=%s, got %s=%s", resourceDesc, key, value, key, labels[key])
+	}
+	return nil
+}
+
+// checkAnnotation checks that annotations contain the expected key=value pair.
+func checkAnnotation(annotations map[string]string, key, value, resourceDesc string) error {
+	if annotations[key] != value {
+		return fmt.Errorf("%s: expected annotation %s=%s, got %s=%s", resourceDesc, key, value, key, annotations[key])
+	}
+	return nil
+}
+
+// checkPodNoRestarts checks that all container statuses have zero restarts.
+func checkPodNoRestarts(pod *corev1.Pod, desc string) error {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.RestartCount > 0 {
+			return fmt.Errorf("%s: container %s has %d restarts", desc, cs.Name, cs.RestartCount)
+		}
+	}
+	return nil
+}
+
+// checkPodNoOOMKills checks that no containers were OOM-killed.
+func checkPodNoOOMKills(pod *corev1.Pod, desc string) error {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.LastTerminationState.Terminated != nil &&
+			cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
+			return fmt.Errorf("%s: container %s was OOMKilled", desc, cs.Name)
+		}
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
+			return fmt.Errorf("%s: container %s was OOMKilled", desc, cs.Name)
+		}
+	}
+	return nil
+}
+
+// checkDeploymentProgressing checks that the deployment has a Progressing=True condition.
+func checkDeploymentProgressing(deploy *appsv1.Deployment, desc string) error {
+	for _, cond := range deploy.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing {
+			if cond.Status == corev1.ConditionTrue {
+				return nil
+			}
+			return fmt.Errorf("%s not progressing: %s", desc, cond.Message)
+		}
+	}
+	return fmt.Errorf("%s has no Progressing condition", desc)
+}
+
+// ============================================================================
+// Generic Assertion (uses "kind/name" resource references)
+// ============================================================================
 
 // Assert returns an assertion builder for the given resource.
 // Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
@@ -34,13 +112,13 @@ func (a *Assertion) HasLabel(key, value string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	obj, err := a.ctx.getResource(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -50,31 +128,12 @@ func (a *Assertion) HasLabel(key, value string) *Assertion {
 		return a
 	}
 
-	// Get labels from the object
-	var labels map[string]string
-	switch o := obj.(type) {
-	case *corev1.Pod:
-		labels = o.Labels
-	case *corev1.ConfigMap:
-		labels = o.Labels
-	case *corev1.Secret:
-		labels = o.Labels
-	case *corev1.Service:
-		labels = o.Labels
-	case *appsv1.Deployment:
-		labels = o.Labels
-	case *appsv1.StatefulSet:
-		labels = o.Labels
-	case *appsv1.DaemonSet:
-		labels = o.Labels
-	default:
-		a.err = fmt.Errorf("HasLabel: unsupported resource type %T", obj)
+	labels, err := objectLabels(obj)
+	if err != nil {
+		a.err = fmt.Errorf("HasLabel: %w", err)
 		return a
 	}
-
-	if labels[key] != value {
-		a.err = fmt.Errorf("expected label %s=%s, got %s=%s", key, value, key, labels[key])
-	}
+	a.err = checkLabel(labels, key, value, a.resource)
 	return a
 }
 
@@ -84,13 +143,13 @@ func (a *Assertion) HasAnnotation(key, value string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	obj, err := a.ctx.getResource(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -100,30 +159,12 @@ func (a *Assertion) HasAnnotation(key, value string) *Assertion {
 		return a
 	}
 
-	var annotations map[string]string
-	switch o := obj.(type) {
-	case *corev1.Pod:
-		annotations = o.Annotations
-	case *corev1.ConfigMap:
-		annotations = o.Annotations
-	case *corev1.Secret:
-		annotations = o.Annotations
-	case *corev1.Service:
-		annotations = o.Annotations
-	case *appsv1.Deployment:
-		annotations = o.Annotations
-	case *appsv1.StatefulSet:
-		annotations = o.Annotations
-	case *appsv1.DaemonSet:
-		annotations = o.Annotations
-	default:
-		a.err = fmt.Errorf("HasAnnotation: unsupported resource type %T", obj)
+	annotations, err := objectAnnotations(obj)
+	if err != nil {
+		a.err = fmt.Errorf("HasAnnotation: %w", err)
 		return a
 	}
-
-	if annotations[key] != value {
-		a.err = fmt.Errorf("expected annotation %s=%s, got %s=%s", key, value, key, annotations[key])
-	}
+	a.err = checkAnnotation(annotations, key, value, a.resource)
 	return a
 }
 
@@ -133,13 +174,13 @@ func (a *Assertion) IsReady() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	ready, err := a.ctx.isReady(strings.ToLower(parts[0]), parts[1])
+	ready, err := a.ctx.isReady(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -156,13 +197,13 @@ func (a *Assertion) Exists() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	obj, err := a.ctx.getResource(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -193,15 +234,15 @@ func (a *Assertion) HasReplicas(expected int) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-	ctx := context.Background()
+	kind := ref.Kind
+	name := ref.Name
+	ctx := a.ctx.goCtx
 
 	var ready int32
 	switch kind {
@@ -236,38 +277,24 @@ func (a *Assertion) IsProgressing() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
-		return a
-	}
-
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-
-	if kind != "deployment" {
-		a.err = fmt.Errorf("IsProgressing: only supports deployments, got %s", kind)
-		return a
-	}
-
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	ref, err := ParseResourceRef(a.resource)
 	if err != nil {
 		a.err = err
 		return a
 	}
 
-	// Check for Progressing condition
-	for _, cond := range deploy.Status.Conditions {
-		if cond.Type == appsv1.DeploymentProgressing {
-			if cond.Status == corev1.ConditionTrue {
-				return a // progressing
-			}
-			a.err = fmt.Errorf("deployment not progressing: %s", cond.Message)
-			return a
-		}
+	if ref.Kind != "deployment" {
+		a.err = fmt.Errorf("IsProgressing: only supports deployments, got %s", ref.Kind)
+		return a
 	}
 
-	a.err = fmt.Errorf("deployment has no Progressing condition")
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(a.ctx.goCtx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	a.err = checkDeploymentProgressing(deploy, "deployment")
 	return a
 }
 
@@ -277,32 +304,24 @@ func (a *Assertion) HasNoRestarts() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
-		return a
-	}
-
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-
-	if kind != "pod" {
-		a.err = fmt.Errorf("HasNoRestarts: only supports pods, got %s", kind)
-		return a
-	}
-
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	ref, err := ParseResourceRef(a.resource)
 	if err != nil {
 		a.err = err
 		return a
 	}
 
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.RestartCount > 0 {
-			a.err = fmt.Errorf("container %s has %d restarts", cs.Name, cs.RestartCount)
-			return a
-		}
+	if ref.Kind != "pod" {
+		a.err = fmt.Errorf("HasNoRestarts: only supports pods, got %s", ref.Kind)
+		return a
 	}
+
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(a.ctx.goCtx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	a.err = checkPodNoRestarts(pod, a.resource)
 	return a
 }
 
@@ -312,21 +331,18 @@ func (a *Assertion) LogsContain(text string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-
-	if kind != "pod" {
-		a.err = fmt.Errorf("LogsContain: only supports pods, got %s", kind)
+	if ref.Kind != "pod" {
+		a.err = fmt.Errorf("LogsContain: only supports pods, got %s", ref.Kind)
 		return a
 	}
 
-	logs, err := a.ctx.Logs(name)
+	logs, err := a.ctx.Logs(ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -344,40 +360,24 @@ func (a *Assertion) NoOOMKills() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
-		return a
-	}
-
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-
-	if kind != "pod" {
-		a.err = fmt.Errorf("NoOOMKills: only supports pods, got %s", kind)
-		return a
-	}
-
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	ref, err := ParseResourceRef(a.resource)
 	if err != nil {
 		a.err = err
 		return a
 	}
 
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.LastTerminationState.Terminated != nil {
-			if cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
-				a.err = fmt.Errorf("container %s was OOMKilled", cs.Name)
-				return a
-			}
-		}
-		if cs.State.Terminated != nil {
-			if cs.State.Terminated.Reason == "OOMKilled" {
-				a.err = fmt.Errorf("container %s was OOMKilled", cs.Name)
-				return a
-			}
-		}
+	if ref.Kind != "pod" {
+		a.err = fmt.Errorf("NoOOMKills: only supports pods, got %s", ref.Kind)
+		return a
 	}
+
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(a.ctx.goCtx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		a.err = err
+		return a
+	}
+
+	a.err = checkPodNoOOMKills(pod, a.resource)
 	return a
 }
 
@@ -397,14 +397,17 @@ func (c *Context) AssertPVC(name string) *PVCAssertion {
 	return &PVCAssertion{ctx: c, name: name}
 }
 
+func (a *PVCAssertion) getPVC() (*corev1.PersistentVolumeClaim, error) {
+	return a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
+}
+
 // Exists asserts the PVC exists.
 func (a *PVCAssertion) Exists() *PVCAssertion {
 	if a.err != nil {
 		return a
 	}
-	_, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
-	if err != nil {
+	if _, err := a.getPVC(); err != nil {
 		a.err = fmt.Errorf("PVC %s does not exist: %w", a.name, err)
 	}
 	return a
@@ -415,8 +418,7 @@ func (a *PVCAssertion) IsBound() *PVCAssertion {
 	if a.err != nil {
 		return a
 	}
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pvc, err := a.getPVC()
 	if err != nil {
 		a.err = err
 		return a
@@ -432,8 +434,7 @@ func (a *PVCAssertion) HasStorageClass(expected string) *PVCAssertion {
 	if a.err != nil {
 		return a
 	}
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pvc, err := a.getPVC()
 	if err != nil {
 		a.err = err
 		return a
@@ -453,8 +454,7 @@ func (a *PVCAssertion) HasCapacity(expected string) *PVCAssertion {
 	if a.err != nil {
 		return a
 	}
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pvc, err := a.getPVC()
 	if err != nil {
 		a.err = err
 		return a
@@ -480,15 +480,12 @@ func (a *PVCAssertion) HasLabel(key, value string) *PVCAssertion {
 	if a.err != nil {
 		return a
 	}
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pvc, err := a.getPVC()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if pvc.Labels[key] != value {
-		a.err = fmt.Errorf("PVC %s: expected label %s=%s, got %s=%s", a.name, key, value, key, pvc.Labels[key])
-	}
+	a.err = checkLabel(pvc.Labels, key, value, fmt.Sprintf("PVC %s", a.name))
 	return a
 }
 
@@ -497,15 +494,12 @@ func (a *PVCAssertion) HasAnnotation(key, value string) *PVCAssertion {
 	if a.err != nil {
 		return a
 	}
-	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pvc, err := a.getPVC()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if pvc.Annotations[key] != value {
-		a.err = fmt.Errorf("PVC %s: expected annotation %s=%s, got %s=%s", a.name, key, value, key, pvc.Annotations[key])
-	}
+	a.err = checkAnnotation(pvc.Annotations, key, value, fmt.Sprintf("PVC %s", a.name))
 	return a
 }
 
@@ -537,14 +531,17 @@ func (c *Context) AssertPod(name string) *PodAssertion {
 	return &PodAssertion{ctx: c, name: name}
 }
 
+func (a *PodAssertion) getPod() (*corev1.Pod, error) {
+	return a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
+}
+
 // Exists asserts the Pod exists.
 func (a *PodAssertion) Exists() *PodAssertion {
 	if a.err != nil {
 		return a
 	}
-	_, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
-	if err != nil {
+	if _, err := a.getPod(); err != nil {
 		a.err = fmt.Errorf("pod %s does not exist: %w", a.name, err)
 	}
 	return a
@@ -555,18 +552,14 @@ func (a *PodAssertion) IsReady() *PodAssertion {
 	if a.err != nil {
 		return a
 	}
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pod, err := a.getPod()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-			return a
-		}
+	if !isPodReady(pod) {
+		a.err = fmt.Errorf("pod %s is not ready", a.name)
 	}
-	a.err = fmt.Errorf("pod %s is not ready", a.name)
 	return a
 }
 
@@ -575,18 +568,12 @@ func (a *PodAssertion) HasNoRestarts() *PodAssertion {
 	if a.err != nil {
 		return a
 	}
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pod, err := a.getPod()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.RestartCount > 0 {
-			a.err = fmt.Errorf("pod %s: container %s has %d restarts", a.name, cs.Name, cs.RestartCount)
-			return a
-		}
-	}
+	a.err = checkPodNoRestarts(pod, fmt.Sprintf("pod %s", a.name))
 	return a
 }
 
@@ -595,23 +582,12 @@ func (a *PodAssertion) NoOOMKills() *PodAssertion {
 	if a.err != nil {
 		return a
 	}
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pod, err := a.getPod()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.LastTerminationState.Terminated != nil &&
-			cs.LastTerminationState.Terminated.Reason == "OOMKilled" {
-			a.err = fmt.Errorf("pod %s: container %s was OOMKilled", a.name, cs.Name)
-			return a
-		}
-		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "OOMKilled" {
-			a.err = fmt.Errorf("pod %s: container %s was OOMKilled", a.name, cs.Name)
-			return a
-		}
-	}
+	a.err = checkPodNoOOMKills(pod, fmt.Sprintf("pod %s", a.name))
 	return a
 }
 
@@ -636,15 +612,12 @@ func (a *PodAssertion) HasLabel(key, value string) *PodAssertion {
 	if a.err != nil {
 		return a
 	}
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pod, err := a.getPod()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if pod.Labels[key] != value {
-		a.err = fmt.Errorf("pod %s: expected label %s=%s, got %s=%s", a.name, key, value, key, pod.Labels[key])
-	}
+	a.err = checkLabel(pod.Labels, key, value, fmt.Sprintf("pod %s", a.name))
 	return a
 }
 
@@ -653,15 +626,12 @@ func (a *PodAssertion) HasAnnotation(key, value string) *PodAssertion {
 	if a.err != nil {
 		return a
 	}
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	pod, err := a.getPod()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if pod.Annotations[key] != value {
-		a.err = fmt.Errorf("pod %s: expected annotation %s=%s, got %s=%s", a.name, key, value, key, pod.Annotations[key])
-	}
+	a.err = checkAnnotation(pod.Annotations, key, value, fmt.Sprintf("pod %s", a.name))
 	return a
 }
 
@@ -693,14 +663,17 @@ func (c *Context) AssertDeployment(name string) *DeploymentAssertion {
 	return &DeploymentAssertion{ctx: c, name: name}
 }
 
+func (a *DeploymentAssertion) getDeployment() (*appsv1.Deployment, error) {
+	return a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
+}
+
 // Exists asserts the Deployment exists.
 func (a *DeploymentAssertion) Exists() *DeploymentAssertion {
 	if a.err != nil {
 		return a
 	}
-	_, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
-	if err != nil {
+	if _, err := a.getDeployment(); err != nil {
 		a.err = fmt.Errorf("Deployment %s does not exist: %w", a.name, err)
 	}
 	return a
@@ -711,8 +684,7 @@ func (a *DeploymentAssertion) HasReplicas(expected int) *DeploymentAssertion {
 	if a.err != nil {
 		return a
 	}
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	deploy, err := a.getDeployment()
 	if err != nil {
 		a.err = err
 		return a
@@ -729,8 +701,7 @@ func (a *DeploymentAssertion) IsReady() *DeploymentAssertion {
 	if a.err != nil {
 		return a
 	}
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	deploy, err := a.getDeployment()
 	if err != nil {
 		a.err = err
 		return a
@@ -750,22 +721,12 @@ func (a *DeploymentAssertion) IsProgressing() *DeploymentAssertion {
 	if a.err != nil {
 		return a
 	}
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	deploy, err := a.getDeployment()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	for _, cond := range deploy.Status.Conditions {
-		if cond.Type == appsv1.DeploymentProgressing {
-			if cond.Status == corev1.ConditionTrue {
-				return a
-			}
-			a.err = fmt.Errorf("Deployment %s not progressing: %s", a.name, cond.Message)
-			return a
-		}
-	}
-	a.err = fmt.Errorf("Deployment %s has no Progressing condition", a.name)
+	a.err = checkDeploymentProgressing(deploy, fmt.Sprintf("Deployment %s", a.name))
 	return a
 }
 
@@ -774,16 +735,12 @@ func (a *DeploymentAssertion) HasLabel(key, value string) *DeploymentAssertion {
 	if a.err != nil {
 		return a
 	}
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	deploy, err := a.getDeployment()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if deploy.Labels[key] != value {
-		a.err = fmt.Errorf("Deployment %s: expected label %s=%s, got %s=%s",
-			a.name, key, value, key, deploy.Labels[key])
-	}
+	a.err = checkLabel(deploy.Labels, key, value, fmt.Sprintf("Deployment %s", a.name))
 	return a
 }
 
@@ -792,16 +749,12 @@ func (a *DeploymentAssertion) HasAnnotation(key, value string) *DeploymentAssert
 	if a.err != nil {
 		return a
 	}
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	deploy, err := a.getDeployment()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if deploy.Annotations[key] != value {
-		a.err = fmt.Errorf("Deployment %s: expected annotation %s=%s, got %s=%s",
-			a.name, key, value, key, deploy.Annotations[key])
-	}
+	a.err = checkAnnotation(deploy.Annotations, key, value, fmt.Sprintf("Deployment %s", a.name))
 	return a
 }
 
@@ -833,14 +786,17 @@ func (c *Context) AssertService(name string) *ServiceAssertion {
 	return &ServiceAssertion{ctx: c, name: name}
 }
 
+func (a *ServiceAssertion) getService() (*corev1.Service, error) {
+	return a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
+}
+
 // Exists asserts the Service exists.
 func (a *ServiceAssertion) Exists() *ServiceAssertion {
 	if a.err != nil {
 		return a
 	}
-	_, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
-	if err != nil {
+	if _, err := a.getService(); err != nil {
 		a.err = fmt.Errorf("Service %s does not exist: %w", a.name, err)
 	}
 	return a
@@ -851,16 +807,12 @@ func (a *ServiceAssertion) HasLabel(key, value string) *ServiceAssertion {
 	if a.err != nil {
 		return a
 	}
-	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	svc, err := a.getService()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if svc.Labels[key] != value {
-		a.err = fmt.Errorf("Service %s: expected label %s=%s, got %s=%s",
-			a.name, key, value, key, svc.Labels[key])
-	}
+	a.err = checkLabel(svc.Labels, key, value, fmt.Sprintf("Service %s", a.name))
 	return a
 }
 
@@ -869,16 +821,12 @@ func (a *ServiceAssertion) HasAnnotation(key, value string) *ServiceAssertion {
 	if a.err != nil {
 		return a
 	}
-	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	svc, err := a.getService()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if svc.Annotations[key] != value {
-		a.err = fmt.Errorf("Service %s: expected annotation %s=%s, got %s=%s",
-			a.name, key, value, key, svc.Annotations[key])
-	}
+	a.err = checkAnnotation(svc.Annotations, key, value, fmt.Sprintf("Service %s", a.name))
 	return a
 }
 
@@ -887,8 +835,7 @@ func (a *ServiceAssertion) HasPort(port int32) *ServiceAssertion {
 	if a.err != nil {
 		return a
 	}
-	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	svc, err := a.getService()
 	if err != nil {
 		a.err = err
 		return a
@@ -907,8 +854,7 @@ func (a *ServiceAssertion) HasSelector(key, value string) *ServiceAssertion {
 	if a.err != nil {
 		return a
 	}
-	svc, err := a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	svc, err := a.getService()
 	if err != nil {
 		a.err = err
 		return a
@@ -948,14 +894,17 @@ func (c *Context) AssertStatefulSet(name string) *StatefulSetAssertion {
 	return &StatefulSetAssertion{ctx: c, name: name}
 }
 
+func (a *StatefulSetAssertion) getStatefulSet() (*appsv1.StatefulSet, error) {
+	return a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
+}
+
 // Exists asserts the StatefulSet exists.
 func (a *StatefulSetAssertion) Exists() *StatefulSetAssertion {
 	if a.err != nil {
 		return a
 	}
-	_, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
-	if err != nil {
+	if _, err := a.getStatefulSet(); err != nil {
 		a.err = fmt.Errorf("StatefulSet %s does not exist: %w", a.name, err)
 	}
 	return a
@@ -966,8 +915,7 @@ func (a *StatefulSetAssertion) HasReplicas(expected int) *StatefulSetAssertion {
 	if a.err != nil {
 		return a
 	}
-	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	ss, err := a.getStatefulSet()
 	if err != nil {
 		a.err = err
 		return a
@@ -984,8 +932,7 @@ func (a *StatefulSetAssertion) IsReady() *StatefulSetAssertion {
 	if a.err != nil {
 		return a
 	}
-	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	ss, err := a.getStatefulSet()
 	if err != nil {
 		a.err = err
 		return a
@@ -1005,16 +952,12 @@ func (a *StatefulSetAssertion) HasLabel(key, value string) *StatefulSetAssertion
 	if a.err != nil {
 		return a
 	}
-	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	ss, err := a.getStatefulSet()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if ss.Labels[key] != value {
-		a.err = fmt.Errorf("StatefulSet %s: expected label %s=%s, got %s=%s",
-			a.name, key, value, key, ss.Labels[key])
-	}
+	a.err = checkLabel(ss.Labels, key, value, fmt.Sprintf("StatefulSet %s", a.name))
 	return a
 }
 
@@ -1023,16 +966,12 @@ func (a *StatefulSetAssertion) HasAnnotation(key, value string) *StatefulSetAsse
 	if a.err != nil {
 		return a
 	}
-	ss, err := a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+	ss, err := a.getStatefulSet()
 	if err != nil {
 		a.err = err
 		return a
 	}
-	if ss.Annotations[key] != value {
-		a.err = fmt.Errorf("StatefulSet %s: expected annotation %s=%s, got %s=%s",
-			a.name, key, value, key, ss.Annotations[key])
-	}
+	a.err = checkAnnotation(ss.Annotations, key, value, fmt.Sprintf("StatefulSet %s", a.name))
 	return a
 }
 
@@ -1065,8 +1004,8 @@ func (c *Context) Eventually(fn func() bool) *EventuallyBuilder {
 	return &EventuallyBuilder{
 		ctx:      c,
 		fn:       fn,
-		timeout:  30 * time.Second, // default
-		interval: 1 * time.Second,  // default
+		timeout:  c.waitTimeout,
+		interval: c.pollInterval,
 	}
 }
 
@@ -1119,8 +1058,8 @@ func (c *Context) Consistently(fn func() bool) *ConsistentlyBuilder {
 	return &ConsistentlyBuilder{
 		ctx:      c,
 		fn:       fn,
-		duration: 5 * time.Second,        // default
-		interval: 500 * time.Millisecond, // default
+		duration: 5 * time.Second,
+		interval: c.pollInterval,
 	}
 }
 

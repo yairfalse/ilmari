@@ -1,8 +1,6 @@
 package ilmari
 
 import (
-	"context"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -25,7 +23,7 @@ func (c *Context) ApplyDynamic(gvr schema.GroupVersionResource, obj map[string]i
 	u := &unstructured.Unstructured{Object: obj}
 	name := u.GetName()
 
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	// Try to get existing resource
 	_, getErr := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(ctx, name, metav1.GetOptions{})
@@ -45,7 +43,7 @@ func (c *Context) ApplyDynamic(gvr schema.GroupVersionResource, obj map[string]i
 // GetDynamic retrieves an object using the dynamic client.
 // Returns the object as a map[string]interface{}.
 func (c *Context) GetDynamic(gvr schema.GroupVersionResource, name string) (map[string]interface{}, error) {
-	u, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	u, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).Get(c.goCtx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -55,12 +53,12 @@ func (c *Context) GetDynamic(gvr schema.GroupVersionResource, name string) (map[
 
 // DeleteDynamic deletes an object using the dynamic client.
 func (c *Context) DeleteDynamic(gvr schema.GroupVersionResource, name string) error {
-	return c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	return c.Dynamic.Resource(gvr).Namespace(c.Namespace).Delete(c.goCtx, name, metav1.DeleteOptions{})
 }
 
 // ListDynamic lists objects using the dynamic client.
 func (c *Context) ListDynamic(gvr schema.GroupVersionResource) ([]map[string]interface{}, error) {
-	list, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	list, err := c.Dynamic.Resource(gvr).Namespace(c.Namespace).List(c.goCtx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}

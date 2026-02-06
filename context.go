@@ -40,6 +40,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// Default timeout and polling values.
+const (
+	// DefaultWaitTimeout is the default timeout for wait operations.
+	DefaultWaitTimeout = 60 * time.Second
+
+	// DefaultPollInterval is the default polling interval for wait operations.
+	DefaultPollInterval = 1 * time.Second
+)
+
 // Context provides a Kubernetes connection for SDK operations.
 type Context struct {
 	// Client is the Kubernetes clientset
@@ -62,6 +71,15 @@ type Context struct {
 
 	// restConfig is stored for operations that need it
 	restConfig *rest.Config
+
+	// waitTimeout is the default timeout for wait operations
+	waitTimeout time.Duration
+
+	// pollInterval is the default polling interval for wait operations
+	pollInterval time.Duration
+
+	// goCtx is the base Go context for API calls, enabling cancellation and timeout propagation
+	goCtx context.Context
 }
 
 // Config configures the test context behavior.
@@ -97,6 +115,9 @@ type contextOptions struct {
 	kubeconfig     string
 	namespace      string // use existing namespace (shared)
 	isolatedPrefix string // create isolated namespace with prefix
+	waitTimeout    time.Duration
+	pollInterval   time.Duration
+	goCtx          context.Context
 }
 
 // WithKubeconfig sets a custom kubeconfig path.
@@ -121,6 +142,29 @@ func WithIsolatedNamespace(prefix string) ContextOption {
 	return func(o *contextOptions) {
 		o.isolatedPrefix = prefix
 		o.namespace = "" // clear shared if set
+	}
+}
+
+// WithWaitTimeout sets the default timeout for wait operations.
+func WithWaitTimeout(d time.Duration) ContextOption {
+	return func(o *contextOptions) {
+		o.waitTimeout = d
+	}
+}
+
+// WithPollInterval sets the default polling interval for wait operations.
+func WithPollInterval(d time.Duration) ContextOption {
+	return func(o *contextOptions) {
+		o.pollInterval = d
+	}
+}
+
+// WithGoContext sets the base Go context for API calls.
+// This enables cancellation and timeout propagation for all operations.
+// Defaults to context.Background() if not set.
+func WithGoContext(ctx context.Context) ContextOption {
+	return func(o *contextOptions) {
+		o.goCtx = ctx
 	}
 }
 
@@ -175,11 +219,27 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 		&cachedDiscovery{DiscoveryInterface: discoveryClient},
 	)
 
+	waitTimeout := DefaultWaitTimeout
+	if options.waitTimeout > 0 {
+		waitTimeout = options.waitTimeout
+	}
+	pollInterval := DefaultPollInterval
+	if options.pollInterval > 0 {
+		pollInterval = options.pollInterval
+	}
+	goCtx := options.goCtx
+	if goCtx == nil {
+		goCtx = context.Background()
+	}
+
 	ctx := &Context{
-		Client:     client,
-		Dynamic:    dynamicClient,
-		mapper:     mapper,
-		restConfig: config,
+		Client:       client,
+		Dynamic:      dynamicClient,
+		mapper:       mapper,
+		restConfig:   config,
+		waitTimeout:  waitTimeout,
+		pollInterval: pollInterval,
+		goCtx:        goCtx,
 	}
 
 	// Handle namespace: shared vs isolated
@@ -206,7 +266,7 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 			},
 		}
 
-		_, err = client.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+		_, err = client.CoreV1().Namespaces().Create(goCtx, ns, metav1.CreateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create namespace: %w", err)
 		}
@@ -324,6 +384,9 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 		mapper:        mapper,
 		ownsNamespace: true,
 		restConfig:    config,
+		waitTimeout:   DefaultWaitTimeout,
+		pollInterval:  DefaultPollInterval,
+		goCtx:         context.Background(),
 	}, nil
 }
 
@@ -464,7 +527,7 @@ var commonKindMappings = map[string]schema.GroupVersionResource{
 // cleanup deletes the test namespace.
 func (c *Context) cleanup() error {
 	err := c.Client.CoreV1().Namespaces().Delete(
-		context.Background(),
+		c.goCtx,
 		c.Namespace,
 		metav1.DeleteOptions{},
 	)
@@ -555,7 +618,7 @@ func (c *Context) dumpDiagnostics() {
 	c.t.Logf("Namespace: %s (kept for debugging)", c.Namespace)
 
 	// Dump pod logs and states
-	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(c.goCtx, metav1.ListOptions{})
 	if err == nil {
 		c.t.Logf("\n--- Pods ---")
 		for _, pod := range pods.Items {
@@ -617,8 +680,6 @@ func (c *Context) Apply(obj runtime.Object) error {
 		return fmt.Errorf("failed to convert to unstructured: %w", err)
 	}
 
-	ctx := context.Background()
-
 	// Auto-detect: use cluster or namespaced client
 	var client dynamic.ResourceInterface
 	if c.isClusterScoped(gvr) {
@@ -628,15 +689,15 @@ func (c *Context) Apply(obj runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	_, err = client.Create(ctx, u, metav1.CreateOptions{})
+	_, err = client.Create(c.goCtx, u, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
 		// Get existing to preserve resourceVersion
-		existing, getErr := client.Get(ctx, u.GetName(), metav1.GetOptions{})
+		existing, getErr := client.Get(c.goCtx, u.GetName(), metav1.GetOptions{})
 		if getErr != nil {
 			return getErr
 		}
 		u.SetResourceVersion(existing.GetResourceVersion())
-		_, err = client.Update(ctx, u, metav1.UpdateOptions{})
+		_, err = client.Update(c.goCtx, u, metav1.UpdateOptions{})
 	}
 	return err
 }
@@ -658,7 +719,7 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	u, err := client.Get(context.Background(), name, metav1.GetOptions{})
+	u, err := client.Get(c.goCtx, name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -684,7 +745,7 @@ func (c *Context) Delete(name string, obj runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	return client.Delete(context.Background(), name, metav1.DeleteOptions{})
+	return client.Delete(c.goCtx, name, metav1.DeleteOptions{})
 }
 
 // List retrieves all resources of a type.
@@ -705,7 +766,7 @@ func (c *Context) List(list runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	u, err := client.List(context.Background(), metav1.ListOptions{})
+	u, err := client.List(c.goCtx, metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -721,29 +782,29 @@ func (c *Context) List(list runtime.Object) error {
 // WaitReady waits for a resource to be ready.
 // Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
 func (c *Context) WaitReady(resource string) error {
-	return c.WaitReadyTimeout(resource, 60*time.Second)
+	return c.WaitReadyTimeout(resource, c.waitTimeout)
 }
 
 // WaitFor waits for a custom condition on a resource.
 // Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
 func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool) error {
-	return c.WaitForTimeout(resource, condition, 60*time.Second)
+	return c.WaitForTimeout(resource, condition, c.waitTimeout)
 }
 
 // WaitForTimeout waits for a custom condition with timeout.
 func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -765,69 +826,11 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 
 // getResource fetches a resource by kind and name.
 func (c *Context) getResource(kind, name string) (interface{}, error) {
-	ctx := context.Background()
-
-	switch kind {
-	case "pod":
-		pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return pod, err
-
-	case "deployment":
-		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return deploy, err
-
-	case "statefulset":
-		ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return ss, err
-
-	case "daemonset":
-		ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return ds, err
-
-	case "configmap":
-		cm, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return cm, err
-
-	case "secret":
-		secret, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return secret, err
-
-	case "service":
-		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return svc, err
-
-	case "pvc", "persistentvolumeclaim":
-		pvc, err := c.Client.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return pvc, err
-
-	default:
-		// Try dynamic client for CRDs
-		return c.getResourceDynamic(kind, name)
+	if h := lookupHandler(kind); h != nil {
+		return h.Get(c.goCtx, c.Client, c.Namespace, name)
 	}
+	// Fallback to dynamic client for CRDs
+	return c.getResourceDynamic(kind, name)
 }
 
 // getResourceDynamic fetches a resource using the dynamic client.
@@ -845,7 +848,7 @@ func (c *Context) getResourceDynamic(kind, name string) (interface{}, error) {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	obj, err := client.Get(context.Background(), name, metav1.GetOptions{})
+	obj, err := client.Get(c.goCtx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, nil
 	}
@@ -854,18 +857,18 @@ func (c *Context) getResourceDynamic(kind, name string) (interface{}, error) {
 
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
 func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -891,14 +894,12 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 		Resource: resource,
 	}
 
-	bgCtx := context.Background()
-
 	// Build label selector for filtering pods
 	var labelSelector string
 
 	// Get deployment status if applicable
 	if kind == "deployment" {
-		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(bgCtx, name, metav1.GetOptions{})
+		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(c.goCtx, name, metav1.GetOptions{})
 		if err == nil {
 			var desired int32 = 1
 			if deploy.Spec.Replicas != nil {
@@ -919,7 +920,7 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 	if labelSelector != "" {
 		listOpts.LabelSelector = labelSelector
 	}
-	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(bgCtx, listOpts)
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(c.goCtx, listOpts)
 	if err == nil {
 		for _, pod := range pods.Items {
 			ps := PodStatus{
@@ -934,63 +935,19 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 				}
 				if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
 					ps.Reason = cs.State.Waiting.Reason
-					// Add hints for common issues (only set if not already set)
-					if waitErr.Hint == "" {
-						switch {
-						case strings.Contains(ps.Reason, "ImagePullBackOff"), strings.Contains(ps.Reason, "ErrImagePull"):
-							imageName := "<unknown>"
-							if len(pod.Spec.Containers) > 0 {
-								imageName = pod.Spec.Containers[0].Image
-							}
-							waitErr.Hint = fmt.Sprintf("Image %q failed to pull.\n"+
-								"  → Verify the image exists: docker pull %s\n"+
-								"  → Check for typos in the image name/tag\n"+
-								"  → For private registries, ensure imagePullSecrets is configured", imageName, imageName)
-						case ps.Reason == "CrashLoopBackOff":
-							waitErr.Hint = "Container is crash-looping.\n" +
-								"  → Check logs: ctx.Logs(\"" + pod.Name + "\")\n" +
-								"  → Common causes: missing env vars, failed health checks, app errors"
-						case ps.Reason == "CreateContainerConfigError":
-							waitErr.Hint = "Container configuration error.\n" +
-								"  → Check if referenced ConfigMaps/Secrets exist\n" +
-								"  → Verify volume mounts are correct"
-						case ps.Reason == "ContainerCreating":
-							waitErr.Hint = "Container is still being created.\n" +
-								"  → May be pulling a large image\n" +
-								"  → Check if PVCs are bound: ctx.WaitPVCBound()"
-						case ps.Reason == "PodInitializing":
-							waitErr.Hint = "Init containers are still running.\n" +
-								"  → Check init container logs for progress"
-						}
-					}
 				}
 				if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
 					if ps.Reason == "" {
 						ps.Reason = cs.State.Terminated.Reason
 					}
-					if waitErr.Hint == "" {
-						if cs.State.Terminated.Reason == "OOMKilled" {
-							waitErr.Hint = "Container was killed due to Out of Memory.\n" +
-								"  → Increase memory limits in resource requests\n" +
-								"  → Check for memory leaks in the application"
-						} else if cs.State.Terminated.ExitCode != 0 {
-							waitErr.Hint = fmt.Sprintf("Container exited with code %d.\n"+
-								"  → Check logs: ctx.Logs(\"%s\")\n"+
-								"  → Exit code 1: general error, 137: OOM/SIGKILL, 143: SIGTERM",
-								cs.State.Terminated.ExitCode, pod.Name)
-						}
-					}
 				}
 			}
-			// Check for pending issues
-			if pod.Status.Phase == "Pending" && waitErr.Hint == "" {
-				for _, cond := range pod.Status.Conditions {
-					if cond.Type == "PodScheduled" && cond.Status == "False" {
-						waitErr.Hint = "Pod cannot be scheduled.\n" +
-							"  → " + cond.Message + "\n" +
-							"  → Check node resources, taints, and node selectors"
-						break
-					}
+
+			// Generate hints from pod state
+			if waitErr.Hint == "" {
+				hints := podHints(&pod)
+				if len(hints) > 0 {
+					waitErr.Hint = hints[0]
 				}
 			}
 
@@ -1015,72 +972,92 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 	return waitErr
 }
 
+// podHints generates diagnostic hints from a pod's current state.
+// Returns a list of hint strings, most relevant first.
+func podHints(pod *corev1.Pod) []string {
+	var hints []string
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			reason := cs.State.Waiting.Reason
+			switch {
+			case strings.Contains(reason, "ImagePullBackOff"), strings.Contains(reason, "ErrImagePull"):
+				imageName := "<unknown>"
+				if len(pod.Spec.Containers) > 0 {
+					imageName = pod.Spec.Containers[0].Image
+				}
+				hints = append(hints, fmt.Sprintf("Image %q failed to pull.\n"+
+					"  → Verify the image exists: docker pull %s\n"+
+					"  → Check for typos in the image name/tag\n"+
+					"  → For private registries, ensure imagePullSecrets is configured", imageName, imageName))
+			case reason == "CrashLoopBackOff":
+				hints = append(hints, "Container is crash-looping.\n"+
+					"  → Check logs: ctx.Logs(\""+pod.Name+"\")\n"+
+					"  → Common causes: missing env vars, failed health checks, app errors")
+			case reason == "CreateContainerConfigError":
+				hints = append(hints, "Container configuration error.\n"+
+					"  → Check if referenced ConfigMaps/Secrets exist\n"+
+					"  → Verify volume mounts are correct")
+			case reason == "ContainerCreating":
+				hints = append(hints, "Container is still being created.\n"+
+					"  → May be pulling a large image\n"+
+					"  → Check if PVCs are bound: ctx.WaitPVCBound()")
+			case reason == "PodInitializing":
+				hints = append(hints, "Init containers are still running.\n"+
+					"  → Check init container logs for progress")
+			}
+		}
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
+			if cs.State.Terminated.Reason == "OOMKilled" {
+				hints = append(hints, "Container was killed due to Out of Memory.\n"+
+					"  → Increase memory limits in resource requests\n"+
+					"  → Check for memory leaks in the application")
+			} else if cs.State.Terminated.ExitCode != 0 {
+				hints = append(hints, fmt.Sprintf("Container exited with code %d.\n"+
+					"  → Check logs: ctx.Logs(\"%s\")\n"+
+					"  → Exit code 1: general error, 137: OOM/SIGKILL, 143: SIGTERM",
+					cs.State.Terminated.ExitCode, pod.Name))
+			}
+		}
+	}
+
+	// Check for scheduling issues
+	if pod.Status.Phase == corev1.PodPending {
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+				hints = append(hints, "Pod cannot be scheduled.\n"+
+					"  → "+cond.Message+"\n"+
+					"  → Check node resources, taints, and node selectors")
+				break
+			}
+		}
+	}
+
+	return hints
+}
+
 // isReady checks if a resource is ready based on its type.
 func (c *Context) isReady(kind, name string) (bool, error) {
-	ctx := context.Background()
-
-	switch kind {
-	case "pod":
-		pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isPodReady(pod), nil
-
-	case "deployment":
-		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isDeploymentReady(deploy), nil
-
-	case "statefulset":
-		ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isStatefulSetReady(ss), nil
-
-	case "daemonset":
-		ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isDaemonSetReady(ds), nil
-
-	case "pvc", "persistentvolumeclaim":
-		pvc, err := c.Client.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return pvc.Status.Phase == corev1.ClaimBound, nil
-
-	default:
-		// Try dynamic client for CRDs - check status.conditions
-		obj, err := c.getResourceDynamic(kind, name)
+	if h := lookupHandler(kind); h != nil {
+		obj, err := h.Get(c.goCtx, c.Client, c.Namespace, name)
 		if err != nil {
 			return false, err
 		}
 		if obj == nil {
 			return false, nil
 		}
-		return c.checkConditions(obj), nil
+		return h.IsReady(obj), nil
 	}
+
+	// Fallback to dynamic client for CRDs - check status.conditions
+	obj, err := c.getResourceDynamic(kind, name)
+	if err != nil {
+		return false, err
+	}
+	if obj == nil {
+		return false, nil
+	}
+	return c.checkConditions(obj), nil
 }
 
 // checkConditions looks for Ready/Accepted/Available/Programmed conditions in CRDs.

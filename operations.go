@@ -1,11 +1,9 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,14 +18,14 @@ import (
 // Scale changes the replica count of a deployment or statefulset.
 // Resource format: "kind/name" (e.g., "deployment/myapp", "statefulset/mydb")
 func (c *Context) Scale(resource string, replicas int) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-	ctx := context.Background()
+	kind := ref.Kind
+	name := ref.Name
+	ctx := c.goCtx
 	r := int32(replicas)
 
 	switch kind {
@@ -61,14 +59,14 @@ func (c *Context) Scale(resource string, replicas int) error {
 // Restart triggers a rolling restart by updating the pod template annotation.
 // Resource format: "kind/name" (e.g., "deployment/myapp")
 func (c *Context) Restart(resource string) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
-	ctx := context.Background()
+	kind := ref.Kind
+	name := ref.Name
+	ctx := c.goCtx
 	restartedAt := time.Now().Format(time.RFC3339)
 
 	switch kind {
@@ -120,13 +118,13 @@ func (c *Context) Restart(resource string) error {
 // Rollback rolls back a deployment to the previous revision.
 // Resource format: "deployment/name"
 func (c *Context) Rollback(resource string) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "deployment" {
 		return &UnsupportedKindError{
@@ -136,7 +134,7 @@ func (c *Context) Rollback(resource string) error {
 		}
 	}
 
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	// Get deployment
 	deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
@@ -212,7 +210,7 @@ func (c *Context) CanI(verb, resource string) (bool, error) {
 	}
 
 	result, err := c.Client.AuthorizationV1().SelfSubjectAccessReviews().Create(
-		context.Background(), review, metav1.CreateOptions{})
+		c.goCtx, review, metav1.CreateOptions{})
 	if err != nil {
 		return false, err
 	}

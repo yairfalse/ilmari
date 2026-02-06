@@ -50,7 +50,10 @@ func TestStackDeploysServices(t *testing.T) {
 		}
 
 		// Test port forward to web service
-		pf := ctx.PortForward("svc/web", 80)
+		pf, err := ctx.PortForward("svc/web", 80)
+		if err != nil {
+			t.Fatalf("PortForward failed: %v", err)
+		}
 		defer pf.Close()
 
 		resp, err := pf.Get("/")
