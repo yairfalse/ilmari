@@ -152,18 +152,21 @@ type TrafficConfig struct {
 }
 
 // RPS sets the requests per second.
-func (t *TrafficConfig) RPS(n int) {
+func (t *TrafficConfig) RPS(n int) *TrafficConfig {
 	t.rps = n
+	return t
 }
 
 // Duration sets how long to generate traffic.
-func (t *TrafficConfig) Duration(d time.Duration) {
+func (t *TrafficConfig) Duration(d time.Duration) *TrafficConfig {
 	t.duration = d
+	return t
 }
 
 // Endpoint sets the HTTP endpoint to hit.
-func (t *TrafficConfig) Endpoint(path string) {
+func (t *TrafficConfig) Endpoint(path string) *TrafficConfig {
 	t.endpoint = path
+	return t
 }
 
 // Traffic represents an ongoing or completed traffic test.
