@@ -42,13 +42,13 @@ func (c *Context) DebugWithOptions(resource string, opts DebugOptions) error {
 		opts.LogLines = 20
 	}
 
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	switch kind {
 	case "deployment":

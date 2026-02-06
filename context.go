@@ -654,13 +654,13 @@ func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool)
 
 // WaitForTimeout waits for a custom condition with timeout.
 func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}) bool, timeout time.Duration) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -776,13 +776,13 @@ func (c *Context) getResourceDynamic(kind, name string) (interface{}, error) {
 
 // WaitReadyTimeout waits for a resource to be ready with custom timeout.
 func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid resource format %q, expected kind/name", resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

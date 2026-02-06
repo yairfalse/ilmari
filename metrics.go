@@ -3,7 +3,6 @@ package ilmari
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -51,7 +50,8 @@ type PodMetricsDetail struct {
 // Requires metrics-server to be installed in the cluster.
 func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 	// Handle "pod/name" format
-	podName = strings.TrimPrefix(podName, "pod/")
+	ref := ParseResourceRefWithDefault(podName, "pod")
+	podName = ref.Name
 
 	metricsClient, err := c.getMetricsClient()
 	if err != nil {
@@ -79,7 +79,8 @@ func (c *Context) Metrics(podName string) (*PodMetrics, error) {
 // Requires metrics-server to be installed in the cluster.
 func (c *Context) MetricsDetail(podName string) (*PodMetricsDetail, error) {
 	// Handle "pod/name" format
-	podName = strings.TrimPrefix(podName, "pod/")
+	ref := ParseResourceRefWithDefault(podName, "pod")
+	podName = ref.Name
 
 	metricsClient, err := c.getMetricsClient()
 	if err != nil {

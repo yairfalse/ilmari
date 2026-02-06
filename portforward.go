@@ -103,13 +103,13 @@ func (pf *PortForward) Do(req *http.Request) (*http.Response, error) {
 // PortForward creates a port forward to a pod or service.
 // Resource format: "svc/name" or "pod/name"
 func (c *Context) PortForward(resource string, port int) *PortForward {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return &PortForward{err: fmt.Errorf("invalid resource format %q, expected kind/name", resource)}
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return &PortForward{err: err}
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	// Get pod name
 	var podName string

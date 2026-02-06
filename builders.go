@@ -90,13 +90,13 @@ func (sb *ServiceBuilder) Command(cmd ...string) *ServiceBuilder {
 // EnvFrom loads environment variables from a ConfigMap or Secret.
 // Resource format: "configmap/name" or "secret/name"
 func (sb *ServiceBuilder) EnvFrom(resource string) *ServiceBuilder {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
 		return sb
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	switch kind {
 	case "configmap":
@@ -261,21 +261,15 @@ func (c *Context) Retry(maxAttempts int, fn func() error) error {
 // Kill deletes a pod, useful for chaos testing.
 // Resource format: "pod/name" or just "name" (assumes pod)
 func (c *Context) Kill(resource string) error {
-	// Parse resource
-	var podName string
-	if strings.Contains(resource, "/") {
-		parts := strings.SplitN(resource, "/", 2)
-		if strings.ToLower(parts[0]) != "pod" {
-			return &UnsupportedKindError{
-				Operation:      "Kill",
-				Kind:           parts[0],
-				SupportedKinds: []string{"pod"},
-			}
+	ref := ParseResourceRefWithDefault(resource, "pod")
+	if ref.Kind != "pod" {
+		return &UnsupportedKindError{
+			Operation:      "Kill",
+			Kind:           ref.Kind,
+			SupportedKinds: []string{"pod"},
 		}
-		podName = parts[1]
-	} else {
-		podName = resource
 	}
+	podName := ref.Name
 
 	// Delete with zero grace period for immediate termination
 	grace := int64(0)

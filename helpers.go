@@ -466,13 +466,8 @@ func (c *Context) WaitPVCBound(resource string) error {
 
 // WaitPVCBoundTimeout waits for a PVC to be bound with custom timeout.
 func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) error {
-	// Extract name (remove pvc/ prefix if present)
-	name := resource
-	if strings.HasPrefix(resource, "pvc/") {
-		name = strings.TrimPrefix(resource, "pvc/")
-	} else if strings.HasPrefix(resource, "persistentvolumeclaim/") {
-		name = strings.TrimPrefix(resource, "persistentvolumeclaim/")
-	}
+	ref := ParseResourceRefWithDefault(resource, "pvc")
+	name := ref.Name
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -502,14 +497,14 @@ func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) er
 // getPVC is a helper that parses the resource string and fetches the PVC.
 // Returns nil and sets a.err if the resource is invalid or not a PVC.
 func (a *Assertion) getPVC(methodName string) *corev1.PersistentVolumeClaim {
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return nil
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "pvc" && kind != "persistentvolumeclaim" {
 		a.err = fmt.Errorf("%s only works with PVCs, got %s", methodName, kind)

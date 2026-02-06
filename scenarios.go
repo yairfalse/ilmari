@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,15 +27,18 @@ type SelfHealTest struct {
 
 // TestSelfHealing runs a self-healing test on a deployment.
 func (c *Context) TestSelfHealing(resource string, fn func(*SelfHealTest)) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
+	}
+	if ref.Kind != "deployment" {
 		return fmt.Errorf("TestSelfHealing requires deployment/name format")
 	}
 
 	test := &SelfHealTest{
 		ctx:             c,
 		resource:        resource,
-		deploymentName:  parts[1],
+		deploymentName:  ref.Name,
 		recoveryTimeout: 60 * time.Second,
 	}
 
@@ -88,15 +90,18 @@ type ScaleTest struct {
 
 // TestScaling runs a scaling test on a deployment.
 func (c *Context) TestScaling(resource string, fn func(*ScaleTest)) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "deployment" {
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
+	}
+	if ref.Kind != "deployment" {
 		return fmt.Errorf("TestScaling requires deployment/name format")
 	}
 
 	test := &ScaleTest{
 		ctx:            c,
 		resource:       resource,
-		deploymentName: parts[1],
+		deploymentName: ref.Name,
 	}
 
 	fn(test)

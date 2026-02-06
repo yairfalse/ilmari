@@ -34,13 +34,13 @@ func (a *Assertion) HasLabel(key, value string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	obj, err := a.ctx.getResource(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -84,13 +84,13 @@ func (a *Assertion) HasAnnotation(key, value string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	obj, err := a.ctx.getResource(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -133,13 +133,13 @@ func (a *Assertion) IsReady() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	ready, err := a.ctx.isReady(strings.ToLower(parts[0]), parts[1])
+	ready, err := a.ctx.isReady(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -156,13 +156,13 @@ func (a *Assertion) Exists() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	obj, err := a.ctx.getResource(strings.ToLower(parts[0]), parts[1])
+	obj, err := a.ctx.getResource(ref.Kind, ref.Name)
 	if err != nil {
 		a.err = err
 		return a
@@ -193,14 +193,14 @@ func (a *Assertion) HasReplicas(expected int) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 	ctx := context.Background()
 
 	var ready int32
@@ -236,14 +236,14 @@ func (a *Assertion) IsProgressing() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "deployment" {
 		a.err = fmt.Errorf("IsProgressing: only supports deployments, got %s", kind)
@@ -277,14 +277,14 @@ func (a *Assertion) HasNoRestarts() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "pod" {
 		a.err = fmt.Errorf("HasNoRestarts: only supports pods, got %s", kind)
@@ -312,14 +312,14 @@ func (a *Assertion) LogsContain(text string) *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "pod" {
 		a.err = fmt.Errorf("LogsContain: only supports pods, got %s", kind)
@@ -344,14 +344,14 @@ func (a *Assertion) NoOOMKills() *Assertion {
 		return a
 	}
 
-	parts := strings.SplitN(a.resource, "/", 2)
-	if len(parts) != 2 {
-		a.err = fmt.Errorf("invalid resource format %q", a.resource)
+	ref, err := ParseResourceRef(a.resource)
+	if err != nil {
+		a.err = err
 		return a
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "pod" {
 		a.err = fmt.Errorf("NoOOMKills: only supports pods, got %s", kind)

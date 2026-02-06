@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,13 +19,13 @@ import (
 // Scale changes the replica count of a deployment or statefulset.
 // Resource format: "kind/name" (e.g., "deployment/myapp", "statefulset/mydb")
 func (c *Context) Scale(resource string, replicas int) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 	ctx := context.Background()
 	r := int32(replicas)
 
@@ -61,13 +60,13 @@ func (c *Context) Scale(resource string, replicas int) error {
 // Restart triggers a rolling restart by updating the pod template annotation.
 // Resource format: "kind/name" (e.g., "deployment/myapp")
 func (c *Context) Restart(resource string) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 	ctx := context.Background()
 	restartedAt := time.Now().Format(time.RFC3339)
 
@@ -120,13 +119,13 @@ func (c *Context) Restart(resource string) error {
 // Rollback rolls back a deployment to the previous revision.
 // Resource format: "deployment/name"
 func (c *Context) Rollback(resource string) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	if kind != "deployment" {
 		return &UnsupportedKindError{

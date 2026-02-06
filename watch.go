@@ -125,13 +125,13 @@ func (c *Context) WaitDeleted(resource string) error {
 
 // WaitDeletedTimeout waits for a resource to be deleted with custom timeout.
 func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -239,13 +239,13 @@ const (
 // Patch applies a patch to a resource.
 // Resource format: "kind/name" (e.g., "deployment/myapp")
 func (c *Context) Patch(resource string, patch []byte, patchType PatchType) error {
-	parts := strings.SplitN(resource, "/", 2)
-	if len(parts) != 2 {
-		return newResourceFormatError(resource)
+	ref, err := ParseResourceRef(resource)
+	if err != nil {
+		return err
 	}
 
-	kind := strings.ToLower(parts[0])
-	name := parts[1]
+	kind := ref.Kind
+	name := ref.Name
 
 	// Convert PatchType to Kubernetes patch type
 	var k8sPatchType types.PatchType
