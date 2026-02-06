@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
 	"time"
@@ -347,54 +348,29 @@ func (c *Context) applyYAML(data []byte) error {
 	return nil
 }
 
+// yamlTypeFactories maps Kind names to factory functions for typed objects.
+var yamlTypeFactories = map[string]func() runtime.Object{
+	"ConfigMap":   func() runtime.Object { return &corev1.ConfigMap{} },
+	"Secret":      func() runtime.Object { return &corev1.Secret{} },
+	"Service":     func() runtime.Object { return &corev1.Service{} },
+	"Pod":         func() runtime.Object { return &corev1.Pod{} },
+	"Deployment":  func() runtime.Object { return &appsv1.Deployment{} },
+	"StatefulSet": func() runtime.Object { return &appsv1.StatefulSet{} },
+	"DaemonSet":   func() runtime.Object { return &appsv1.DaemonSet{} },
+}
+
 // applyTypedYAML applies YAML as a typed resource.
 func (c *Context) applyTypedYAML(data []byte, kind string) error {
-	switch kind {
-	case "ConfigMap":
-		var obj corev1.ConfigMap
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	case "Secret":
-		var obj corev1.Secret
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	case "Service":
-		var obj corev1.Service
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	case "Pod":
-		var obj corev1.Pod
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	case "Deployment":
-		var obj appsv1.Deployment
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	case "StatefulSet":
-		var obj appsv1.StatefulSet
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	case "DaemonSet":
-		var obj appsv1.DaemonSet
-		if err := yaml.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		return c.Apply(&obj)
-	default:
+	factory, ok := yamlTypeFactories[kind]
+	if !ok {
 		return fmt.Errorf("unsupported kind in YAML: %s", kind)
 	}
+
+	obj := factory()
+	if err := yaml.Unmarshal(data, obj); err != nil {
+		return err
+	}
+	return c.Apply(obj)
 }
 
 // ============================================================================
