@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,7 +52,7 @@ func (s *SelfHealTest) KillPod() {
 	}
 
 	// Find a pod from this deployment
-	pods, err := s.ctx.Client.CoreV1().Pods(s.ctx.Namespace).List(context.Background(), metav1.ListOptions{
+	pods, err := s.ctx.Client.CoreV1().Pods(s.ctx.Namespace).List(s.ctx.goCtx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("app=%s", s.deploymentName),
 	})
 	if err != nil {
@@ -115,7 +114,7 @@ func (s *ScaleTest) ScaleTo(n int) {
 	}
 
 	deploy, err := s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Get(
-		context.Background(), s.deploymentName, metav1.GetOptions{})
+		s.ctx.goCtx, s.deploymentName, metav1.GetOptions{})
 	if err != nil {
 		s.err = fmt.Errorf("failed to get deployment: %w", err)
 		return
@@ -125,7 +124,7 @@ func (s *ScaleTest) ScaleTo(n int) {
 	deploy.Spec.Replicas = &replicas
 
 	_, err = s.ctx.Client.AppsV1().Deployments(s.ctx.Namespace).Update(
-		context.Background(), deploy, metav1.UpdateOptions{})
+		s.ctx.goCtx, deploy, metav1.UpdateOptions{})
 	if err != nil {
 		s.err = fmt.Errorf("failed to scale deployment: %w", err)
 	}

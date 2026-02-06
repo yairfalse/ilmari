@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -243,7 +242,7 @@ func (a *Assertion) HasReplicas(expected int) *Assertion {
 
 	kind := ref.Kind
 	name := ref.Name
-	ctx := context.Background()
+	ctx := a.ctx.goCtx
 
 	var ready int32
 	switch kind {
@@ -289,7 +288,7 @@ func (a *Assertion) IsProgressing() *Assertion {
 		return a
 	}
 
-	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(context.Background(), ref.Name, metav1.GetOptions{})
+	deploy, err := a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(a.ctx.goCtx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		a.err = err
 		return a
@@ -316,7 +315,7 @@ func (a *Assertion) HasNoRestarts() *Assertion {
 		return a
 	}
 
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), ref.Name, metav1.GetOptions{})
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(a.ctx.goCtx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		a.err = err
 		return a
@@ -372,7 +371,7 @@ func (a *Assertion) NoOOMKills() *Assertion {
 		return a
 	}
 
-	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(context.Background(), ref.Name, metav1.GetOptions{})
+	pod, err := a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(a.ctx.goCtx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		a.err = err
 		return a
@@ -400,7 +399,7 @@ func (c *Context) AssertPVC(name string) *PVCAssertion {
 
 func (a *PVCAssertion) getPVC() (*corev1.PersistentVolumeClaim, error) {
 	return a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
 }
 
 // Exists asserts the PVC exists.
@@ -534,7 +533,7 @@ func (c *Context) AssertPod(name string) *PodAssertion {
 
 func (a *PodAssertion) getPod() (*corev1.Pod, error) {
 	return a.ctx.Client.CoreV1().Pods(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
 }
 
 // Exists asserts the Pod exists.
@@ -666,7 +665,7 @@ func (c *Context) AssertDeployment(name string) *DeploymentAssertion {
 
 func (a *DeploymentAssertion) getDeployment() (*appsv1.Deployment, error) {
 	return a.ctx.Client.AppsV1().Deployments(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
 }
 
 // Exists asserts the Deployment exists.
@@ -789,7 +788,7 @@ func (c *Context) AssertService(name string) *ServiceAssertion {
 
 func (a *ServiceAssertion) getService() (*corev1.Service, error) {
 	return a.ctx.Client.CoreV1().Services(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
 }
 
 // Exists asserts the Service exists.
@@ -897,7 +896,7 @@ func (c *Context) AssertStatefulSet(name string) *StatefulSetAssertion {
 
 func (a *StatefulSetAssertion) getStatefulSet() (*appsv1.StatefulSet, error) {
 	return a.ctx.Client.AppsV1().StatefulSets(a.ctx.Namespace).Get(
-		context.Background(), a.name, metav1.GetOptions{})
+		a.ctx.goCtx, a.name, metav1.GetOptions{})
 }
 
 // Exists asserts the StatefulSet exists.

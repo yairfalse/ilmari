@@ -31,7 +31,7 @@ import (
 // Logs retrieves logs from a pod.
 func (c *Context) Logs(pod string) (string, error) {
 	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, &corev1.PodLogOptions{})
-	stream, err := req.Stream(context.Background())
+	stream, err := req.Stream(c.goCtx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
@@ -59,7 +59,7 @@ func (c *Context) LogsWithOptions(pod string, opts LogsOptions) (string, error) 
 	}
 
 	req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod, logOpts)
-	stream, err := req.Stream(context.Background())
+	stream, err := req.Stream(c.goCtx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get logs: %w", err)
 	}
@@ -84,7 +84,7 @@ func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 			Follow: true,
 		})
 
-		stream, err := req.Stream(context.Background())
+		stream, err := req.Stream(c.goCtx)
 		if err != nil {
 			return
 		}
@@ -114,7 +114,7 @@ func (c *Context) LogsStream(pod string, callback func(line string)) func() {
 
 // Events returns all events in the test namespace.
 func (c *Context) Events() ([]corev1.Event, error) {
-	list, err := c.Client.CoreV1().Events(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	list, err := c.Client.CoreV1().Events(c.Namespace).List(c.goCtx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list events: %w", err)
 	}
@@ -155,7 +155,7 @@ func (c *Context) Exec(pod string, cmd []string) (string, error) {
 	}
 
 	var stdout, stderr strings.Builder
-	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+	err = executor.StreamWithContext(c.goCtx, remotecommand.StreamOptions{
 		Stdout: &stdout,
 		Stderr: &stderr,
 	})
@@ -230,7 +230,7 @@ func (c *Context) CopyTo(pod, localPath, remotePath string) error {
 	}
 
 	var stdout, stderr strings.Builder
-	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+	err = executor.StreamWithContext(c.goCtx, remotecommand.StreamOptions{
 		Stdin:  &tarBuf,
 		Stdout: &stdout,
 		Stderr: &stderr,
@@ -277,7 +277,7 @@ func (c *Context) CopyFrom(pod, remotePath, localPath string) error {
 	}
 
 	var tarBuf, stderr bytes.Buffer
-	err = executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+	err = executor.StreamWithContext(c.goCtx, remotecommand.StreamOptions{
 		Stdout: &tarBuf,
 		Stderr: &stderr,
 	})
@@ -336,7 +336,7 @@ func (c *Context) LogsAll(selector string) (map[string]string, error) {
 // failures. Check individual values for "[error" prefix to detect per-pod failures.
 func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (map[string]string, error) {
 	// List pods matching selector
-	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(context.Background(), metav1.ListOptions{
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(c.goCtx, metav1.ListOptions{
 		LabelSelector: selector,
 	})
 	if err != nil {
@@ -359,7 +359,7 @@ func (c *Context) LogsAllWithOptions(selector string, opts LogsOptions) (map[str
 		}
 
 		req := c.Client.CoreV1().Pods(c.Namespace).GetLogs(pod.Name, logOpts)
-		stream, streamErr := req.Stream(context.Background())
+		stream, streamErr := req.Stream(c.goCtx)
 		if streamErr != nil {
 			// Store error message instead of failing entirely
 			result[pod.Name] = fmt.Sprintf("[error: %v]", streamErr)
@@ -469,7 +469,7 @@ func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) er
 	ref := ParseResourceRefWithDefault(resource, "pvc")
 	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
 	ticker := time.NewTicker(c.pollInterval)
@@ -512,7 +512,7 @@ func (a *Assertion) getPVC(methodName string) *corev1.PersistentVolumeClaim {
 	}
 
 	pvc, err := a.ctx.Client.CoreV1().PersistentVolumeClaims(a.ctx.Namespace).Get(
-		context.Background(), name, metav1.GetOptions{})
+		a.ctx.goCtx, name, metav1.GetOptions{})
 	if err != nil {
 		a.err = err
 		return nil
@@ -818,7 +818,7 @@ func (i *IngressTest) ExpectBackend(backend string, port int) *IngressTest {
 
 	// Get ingress
 	ing, err := i.ctx.Client.NetworkingV1().Ingresses(i.ctx.Namespace).Get(
-		context.Background(), i.name, metav1.GetOptions{})
+		i.ctx.goCtx, i.name, metav1.GetOptions{})
 	if err != nil {
 		i.err = fmt.Errorf("failed to get ingress %s: %w", i.name, err)
 		return i
@@ -881,7 +881,7 @@ func (i *IngressTest) ExpectTLS(secretName string) *IngressTest {
 	}
 
 	ing, err := i.ctx.Client.NetworkingV1().Ingresses(i.ctx.Namespace).Get(
-		context.Background(), i.name, metav1.GetOptions{})
+		i.ctx.goCtx, i.name, metav1.GetOptions{})
 	if err != nil {
 		i.err = fmt.Errorf("failed to get ingress %s: %w", i.name, err)
 		return i
@@ -952,7 +952,7 @@ func (c *Context) Isolate(selector map[string]string) error {
 	}
 
 	_, err := c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Create(
-		context.Background(), policy, metav1.CreateOptions{})
+		c.goCtx, policy, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create NetworkPolicy: %w", err)
 	}
@@ -989,7 +989,7 @@ func (c *Context) AllowFrom(target, source map[string]string) error {
 	}
 
 	_, err := c.Client.NetworkingV1().NetworkPolicies(c.Namespace).Create(
-		context.Background(), policy, metav1.CreateOptions{})
+		c.goCtx, policy, metav1.CreateOptions{})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create NetworkPolicy: %w", err)
 	}

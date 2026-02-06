@@ -77,6 +77,9 @@ type Context struct {
 
 	// pollInterval is the default polling interval for wait operations
 	pollInterval time.Duration
+
+	// goCtx is the base Go context for API calls, enabling cancellation and timeout propagation
+	goCtx context.Context
 }
 
 // Config configures the test context behavior.
@@ -114,6 +117,7 @@ type contextOptions struct {
 	isolatedPrefix string // create isolated namespace with prefix
 	waitTimeout    time.Duration
 	pollInterval   time.Duration
+	goCtx          context.Context
 }
 
 // WithKubeconfig sets a custom kubeconfig path.
@@ -152,6 +156,15 @@ func WithWaitTimeout(d time.Duration) ContextOption {
 func WithPollInterval(d time.Duration) ContextOption {
 	return func(o *contextOptions) {
 		o.pollInterval = d
+	}
+}
+
+// WithGoContext sets the base Go context for API calls.
+// This enables cancellation and timeout propagation for all operations.
+// Defaults to context.Background() if not set.
+func WithGoContext(ctx context.Context) ContextOption {
+	return func(o *contextOptions) {
+		o.goCtx = ctx
 	}
 }
 
@@ -214,6 +227,10 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 	if options.pollInterval > 0 {
 		pollInterval = options.pollInterval
 	}
+	goCtx := options.goCtx
+	if goCtx == nil {
+		goCtx = context.Background()
+	}
 
 	ctx := &Context{
 		Client:       client,
@@ -222,6 +239,7 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 		restConfig:   config,
 		waitTimeout:  waitTimeout,
 		pollInterval: pollInterval,
+		goCtx:        goCtx,
 	}
 
 	// Handle namespace: shared vs isolated
@@ -245,7 +263,7 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 			},
 		}
 
-		_, err = client.CoreV1().Namespaces().Create(context.Background(), ns, metav1.CreateOptions{})
+		_, err = client.CoreV1().Namespaces().Create(goCtx, ns, metav1.CreateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create namespace: %w", err)
 		}
@@ -362,6 +380,7 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 		restConfig:    config,
 		waitTimeout:   DefaultWaitTimeout,
 		pollInterval:  DefaultPollInterval,
+		goCtx:         context.Background(),
 	}, nil
 }
 
@@ -502,7 +521,7 @@ var commonKindMappings = map[string]schema.GroupVersionResource{
 // cleanup deletes the test namespace.
 func (c *Context) cleanup() error {
 	err := c.Client.CoreV1().Namespaces().Delete(
-		context.Background(),
+		c.goCtx,
 		c.Namespace,
 		metav1.DeleteOptions{},
 	)
@@ -521,7 +540,7 @@ func (c *Context) dumpDiagnostics() {
 	c.t.Logf("Namespace: %s (kept for debugging)", c.Namespace)
 
 	// Dump pod logs and states
-	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(context.Background(), metav1.ListOptions{})
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(c.goCtx, metav1.ListOptions{})
 	if err == nil {
 		c.t.Logf("\n--- Pods ---")
 		for _, pod := range pods.Items {
@@ -583,8 +602,6 @@ func (c *Context) Apply(obj runtime.Object) error {
 		return fmt.Errorf("failed to convert to unstructured: %w", err)
 	}
 
-	ctx := context.Background()
-
 	// Auto-detect: use cluster or namespaced client
 	var client dynamic.ResourceInterface
 	if c.isClusterScoped(gvr) {
@@ -594,15 +611,15 @@ func (c *Context) Apply(obj runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	_, err = client.Create(ctx, u, metav1.CreateOptions{})
+	_, err = client.Create(c.goCtx, u, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
 		// Get existing to preserve resourceVersion
-		existing, getErr := client.Get(ctx, u.GetName(), metav1.GetOptions{})
+		existing, getErr := client.Get(c.goCtx, u.GetName(), metav1.GetOptions{})
 		if getErr != nil {
 			return getErr
 		}
 		u.SetResourceVersion(existing.GetResourceVersion())
-		_, err = client.Update(ctx, u, metav1.UpdateOptions{})
+		_, err = client.Update(c.goCtx, u, metav1.UpdateOptions{})
 	}
 	return err
 }
@@ -624,7 +641,7 @@ func (c *Context) Get(name string, obj runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	u, err := client.Get(context.Background(), name, metav1.GetOptions{})
+	u, err := client.Get(c.goCtx, name, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -650,7 +667,7 @@ func (c *Context) Delete(name string, obj runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	return client.Delete(context.Background(), name, metav1.DeleteOptions{})
+	return client.Delete(c.goCtx, name, metav1.DeleteOptions{})
 }
 
 // List retrieves all resources of a type.
@@ -671,7 +688,7 @@ func (c *Context) List(list runtime.Object) error {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	u, err := client.List(context.Background(), metav1.ListOptions{})
+	u, err := client.List(c.goCtx, metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -706,7 +723,7 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	kind := ref.Kind
 	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
 	ticker := time.NewTicker(c.pollInterval)
@@ -732,7 +749,7 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 // getResource fetches a resource by kind and name.
 func (c *Context) getResource(kind, name string) (interface{}, error) {
 	if h := lookupHandler(kind); h != nil {
-		return h.Get(context.Background(), c.Client, c.Namespace, name)
+		return h.Get(c.goCtx, c.Client, c.Namespace, name)
 	}
 	// Fallback to dynamic client for CRDs
 	return c.getResourceDynamic(kind, name)
@@ -753,7 +770,7 @@ func (c *Context) getResourceDynamic(kind, name string) (interface{}, error) {
 		client = c.Dynamic.Resource(gvr).Namespace(c.Namespace)
 	}
 
-	obj, err := client.Get(context.Background(), name, metav1.GetOptions{})
+	obj, err := client.Get(c.goCtx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil, nil
 	}
@@ -770,7 +787,7 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 	kind := ref.Kind
 	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
 	ticker := time.NewTicker(c.pollInterval)
@@ -799,14 +816,12 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 		Resource: resource,
 	}
 
-	bgCtx := context.Background()
-
 	// Build label selector for filtering pods
 	var labelSelector string
 
 	// Get deployment status if applicable
 	if kind == "deployment" {
-		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(bgCtx, name, metav1.GetOptions{})
+		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(c.goCtx, name, metav1.GetOptions{})
 		if err == nil {
 			var desired int32 = 1
 			if deploy.Spec.Replicas != nil {
@@ -827,7 +842,7 @@ func (c *Context) buildWaitError(resource, kind, name string) *WaitError {
 	if labelSelector != "" {
 		listOpts.LabelSelector = labelSelector
 	}
-	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(bgCtx, listOpts)
+	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(c.goCtx, listOpts)
 	if err == nil {
 		for _, pod := range pods.Items {
 			ps := PodStatus{
@@ -946,7 +961,7 @@ func podHints(pod *corev1.Pod) []string {
 // isReady checks if a resource is ready based on its type.
 func (c *Context) isReady(kind, name string) (bool, error) {
 	if h := lookupHandler(kind); h != nil {
-		obj, err := h.Get(context.Background(), c.Client, c.Namespace, name)
+		obj, err := h.Get(c.goCtx, c.Client, c.Namespace, name)
 		if err != nil {
 			return false, err
 		}

@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,7 +96,7 @@ func (c *Context) PortForward(resource string, port int) (*PortForward, error) {
 
 	// Get pod name
 	var podName string
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	switch kind {
 	case "pod":

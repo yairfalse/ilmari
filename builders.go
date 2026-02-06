@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -275,7 +274,7 @@ func (c *Context) Kill(resource string) error {
 	// Delete with zero grace period for immediate termination
 	grace := int64(0)
 	return c.Client.CoreV1().Pods(c.Namespace).Delete(
-		context.Background(),
+		c.goCtx,
 		podName,
 		metav1.DeleteOptions{GracePeriodSeconds: &grace},
 	)

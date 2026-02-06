@@ -26,7 +26,7 @@ type WatchEvent struct {
 // The stop function is safe to call multiple times.
 // The callback is invoked for each event (ADDED, MODIFIED, DELETED).
 func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) {
-	ctx := context.Background()
+	ctx := c.goCtx
 	kind = strings.ToLower(kind)
 
 	h := lookupHandler(kind)
@@ -106,7 +106,7 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) err
 	kind := ref.Kind
 	name := ref.Name
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(c.goCtx, timeout)
 	defer cancel()
 
 	ticker := time.NewTicker(c.pollInterval)
@@ -132,7 +132,7 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) err
 // resourceExists checks if a resource exists.
 func (c *Context) resourceExists(kind, name string) (bool, error) {
 	if h := lookupHandler(kind); h != nil {
-		return h.Exists(context.Background(), c.Client, c.Namespace, name)
+		return h.Exists(c.goCtx, c.Client, c.Namespace, name)
 	}
 	return false, &UnsupportedKindError{
 		Operation:      "WaitDeleted",
@@ -177,7 +177,7 @@ func (c *Context) Patch(resource string, patch []byte, patchType PatchType) erro
 		k8sPatchType = types.StrategicMergePatchType
 	}
 
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	patchFuncs := map[string]func() error{
 		"pod": func() error {

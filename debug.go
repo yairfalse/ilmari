@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -66,7 +65,7 @@ func (c *Context) DebugWithOptions(resource string, opts DebugOptions) error {
 
 func (c *Context) debugDeployment(name string, opts DebugOptions) error {
 	w := opts.Writer
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -94,7 +93,7 @@ func (c *Context) debugDeployment(name string, opts DebugOptions) error {
 
 func (c *Context) debugStatefulSet(name string, opts DebugOptions) error {
 	w := opts.Writer
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -121,7 +120,7 @@ func (c *Context) debugStatefulSet(name string, opts DebugOptions) error {
 
 func (c *Context) debugDaemonSet(name string, opts DebugOptions) error {
 	w := opts.Writer
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -144,7 +143,7 @@ func (c *Context) debugDaemonSet(name string, opts DebugOptions) error {
 
 func (c *Context) debugPod(name string, opts DebugOptions) error {
 	w := opts.Writer
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -190,7 +189,7 @@ func (c *Context) debugPods(w io.Writer, pods []corev1.Pod, opts DebugOptions) {
 }
 
 func (c *Context) debugEvents(w io.Writer, pods []corev1.Pod) {
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	// Collect pod names for filtering
 	podNames := make(map[string]bool)
@@ -282,7 +281,7 @@ func (c *Context) getPodsForSelector(selector map[string]string) ([]corev1.Pod, 
 	})
 
 	pods, err := c.Client.CoreV1().Pods(c.Namespace).List(
-		context.Background(),
+		c.goCtx,
 		metav1.ListOptions{LabelSelector: labelSelector},
 	)
 	if err != nil {

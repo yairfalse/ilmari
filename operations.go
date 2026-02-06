@@ -1,7 +1,6 @@
 package ilmari
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -26,7 +25,7 @@ func (c *Context) Scale(resource string, replicas int) error {
 
 	kind := ref.Kind
 	name := ref.Name
-	ctx := context.Background()
+	ctx := c.goCtx
 	r := int32(replicas)
 
 	switch kind {
@@ -67,7 +66,7 @@ func (c *Context) Restart(resource string) error {
 
 	kind := ref.Kind
 	name := ref.Name
-	ctx := context.Background()
+	ctx := c.goCtx
 	restartedAt := time.Now().Format(time.RFC3339)
 
 	switch kind {
@@ -135,7 +134,7 @@ func (c *Context) Rollback(resource string) error {
 		}
 	}
 
-	ctx := context.Background()
+	ctx := c.goCtx
 
 	// Get deployment
 	deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
@@ -211,7 +210,7 @@ func (c *Context) CanI(verb, resource string) (bool, error) {
 	}
 
 	result, err := c.Client.AuthorizationV1().SelfSubjectAccessReviews().Create(
-		context.Background(), review, metav1.CreateOptions{})
+		c.goCtx, review, metav1.CreateOptions{})
 	if err != nil {
 		return false, err
 	}
