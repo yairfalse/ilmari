@@ -39,7 +39,7 @@ func (c *Context) TestSelfHealing(resource string, fn func(*SelfHealTest)) error
 		ctx:             c,
 		resource:        resource,
 		deploymentName:  ref.Name,
-		recoveryTimeout: 60 * time.Second,
+		recoveryTimeout: c.waitTimeout,
 	}
 
 	fn(test)
@@ -137,7 +137,7 @@ func (s *ScaleTest) WaitStable() {
 		return
 	}
 
-	s.err = s.ctx.WaitReadyTimeout(s.resource, 60*time.Second)
+	s.err = s.ctx.WaitReadyTimeout(s.resource, s.ctx.waitTimeout)
 }
 
 // ============================================================================

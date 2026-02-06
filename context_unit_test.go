@@ -2,6 +2,7 @@ package ilmari
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
@@ -316,4 +317,32 @@ func TestDefaultConfig(t *testing.T) {
 	assert.True(t, cfg.KeepOnFailure)
 	// KeepAlways depends on env var, just check it doesn't panic
 	_ = cfg.KeepAlways
+}
+
+func TestDefaultTimeoutConstants(t *testing.T) {
+	assert.Equal(t, 60*time.Second, DefaultWaitTimeout)
+	assert.Equal(t, 1*time.Second, DefaultPollInterval)
+}
+
+func TestContext_DefaultTimeouts(t *testing.T) {
+	ctx := &Context{
+		waitTimeout:  DefaultWaitTimeout,
+		pollInterval: DefaultPollInterval,
+	}
+	assert.Equal(t, DefaultWaitTimeout, ctx.waitTimeout)
+	assert.Equal(t, DefaultPollInterval, ctx.pollInterval)
+}
+
+func TestWithWaitTimeout_Option(t *testing.T) {
+	opts := &contextOptions{}
+	opt := WithWaitTimeout(30 * time.Second)
+	opt(opts)
+	assert.Equal(t, 30*time.Second, opts.waitTimeout)
+}
+
+func TestWithPollInterval_Option(t *testing.T) {
+	opts := &contextOptions{}
+	opt := WithPollInterval(500 * time.Millisecond)
+	opt(opts)
+	assert.Equal(t, 500*time.Millisecond, opts.pollInterval)
 }

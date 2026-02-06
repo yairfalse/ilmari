@@ -461,7 +461,7 @@ func (c *Context) SecretTLS(name, certPath, keyPath string) error {
 // WaitPVCBound waits for a PVC to be bound.
 // Resource format: "pvc/name" or just "name"
 func (c *Context) WaitPVCBound(resource string) error {
-	return c.WaitPVCBoundTimeout(resource, 60*time.Second)
+	return c.WaitPVCBoundTimeout(resource, c.waitTimeout)
 }
 
 // WaitPVCBoundTimeout waits for a PVC to be bound with custom timeout.
@@ -472,7 +472,7 @@ func (c *Context) WaitPVCBoundTimeout(resource string, timeout time.Duration) er
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {

@@ -1065,8 +1065,8 @@ func (c *Context) Eventually(fn func() bool) *EventuallyBuilder {
 	return &EventuallyBuilder{
 		ctx:      c,
 		fn:       fn,
-		timeout:  30 * time.Second, // default
-		interval: 1 * time.Second,  // default
+		timeout:  c.waitTimeout,
+		interval: c.pollInterval,
 	}
 }
 
@@ -1119,8 +1119,8 @@ func (c *Context) Consistently(fn func() bool) *ConsistentlyBuilder {
 	return &ConsistentlyBuilder{
 		ctx:      c,
 		fn:       fn,
-		duration: 5 * time.Second,        // default
-		interval: 500 * time.Millisecond, // default
+		duration: 5 * time.Second,
+		interval: c.pollInterval,
 	}
 }
 

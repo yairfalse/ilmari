@@ -120,7 +120,7 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) 
 // WaitDeleted waits for a resource to be deleted.
 // Resource format: "kind/name" (e.g., "pod/myapp", "configmap/myconfig")
 func (c *Context) WaitDeleted(resource string) error {
-	return c.WaitDeletedTimeout(resource, 60*time.Second)
+	return c.WaitDeletedTimeout(resource, c.waitTimeout)
 }
 
 // WaitDeletedTimeout waits for a resource to be deleted with custom timeout.
@@ -136,7 +136,7 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) err
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {

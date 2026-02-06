@@ -40,6 +40,15 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// Default timeout and polling values.
+const (
+	// DefaultWaitTimeout is the default timeout for wait operations.
+	DefaultWaitTimeout = 60 * time.Second
+
+	// DefaultPollInterval is the default polling interval for wait operations.
+	DefaultPollInterval = 1 * time.Second
+)
+
 // Context provides a Kubernetes connection for SDK operations.
 type Context struct {
 	// Client is the Kubernetes clientset
@@ -62,6 +71,12 @@ type Context struct {
 
 	// restConfig is stored for operations that need it
 	restConfig *rest.Config
+
+	// waitTimeout is the default timeout for wait operations
+	waitTimeout time.Duration
+
+	// pollInterval is the default polling interval for wait operations
+	pollInterval time.Duration
 }
 
 // Config configures the test context behavior.
@@ -97,6 +112,8 @@ type contextOptions struct {
 	kubeconfig     string
 	namespace      string // use existing namespace (shared)
 	isolatedPrefix string // create isolated namespace with prefix
+	waitTimeout    time.Duration
+	pollInterval   time.Duration
 }
 
 // WithKubeconfig sets a custom kubeconfig path.
@@ -121,6 +138,20 @@ func WithIsolatedNamespace(prefix string) ContextOption {
 	return func(o *contextOptions) {
 		o.isolatedPrefix = prefix
 		o.namespace = "" // clear shared if set
+	}
+}
+
+// WithWaitTimeout sets the default timeout for wait operations.
+func WithWaitTimeout(d time.Duration) ContextOption {
+	return func(o *contextOptions) {
+		o.waitTimeout = d
+	}
+}
+
+// WithPollInterval sets the default polling interval for wait operations.
+func WithPollInterval(d time.Duration) ContextOption {
+	return func(o *contextOptions) {
+		o.pollInterval = d
 	}
 }
 
@@ -175,11 +206,22 @@ func NewContext(opts ...ContextOption) (*Context, error) {
 		&cachedDiscovery{DiscoveryInterface: discoveryClient},
 	)
 
+	waitTimeout := DefaultWaitTimeout
+	if options.waitTimeout > 0 {
+		waitTimeout = options.waitTimeout
+	}
+	pollInterval := DefaultPollInterval
+	if options.pollInterval > 0 {
+		pollInterval = options.pollInterval
+	}
+
 	ctx := &Context{
-		Client:     client,
-		Dynamic:    dynamicClient,
-		mapper:     mapper,
-		restConfig: config,
+		Client:       client,
+		Dynamic:      dynamicClient,
+		mapper:       mapper,
+		restConfig:   config,
+		waitTimeout:  waitTimeout,
+		pollInterval: pollInterval,
 	}
 
 	// Handle namespace: shared vs isolated
@@ -318,6 +360,8 @@ func newContext(t *testing.T, cfg Config) (*Context, error) {
 		mapper:        mapper,
 		ownsNamespace: true,
 		restConfig:    config,
+		waitTimeout:   DefaultWaitTimeout,
+		pollInterval:  DefaultPollInterval,
 	}, nil
 }
 
@@ -643,13 +687,13 @@ func (c *Context) List(list runtime.Object) error {
 // WaitReady waits for a resource to be ready.
 // Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
 func (c *Context) WaitReady(resource string) error {
-	return c.WaitReadyTimeout(resource, 60*time.Second)
+	return c.WaitReadyTimeout(resource, c.waitTimeout)
 }
 
 // WaitFor waits for a custom condition on a resource.
 // Resource format: "kind/name" (e.g., "pod/myapp", "deployment/nginx")
 func (c *Context) WaitFor(resource string, condition func(obj interface{}) bool) error {
-	return c.WaitForTimeout(resource, condition, 60*time.Second)
+	return c.WaitForTimeout(resource, condition, c.waitTimeout)
 }
 
 // WaitForTimeout waits for a custom condition with timeout.
@@ -665,7 +709,7 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -787,7 +831,7 @@ func (c *Context) WaitReadyTimeout(resource string, timeout time.Duration) error
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 
 	for {
