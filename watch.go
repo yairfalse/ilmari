@@ -7,10 +7,8 @@ import (
 	"sync"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/watch"
 )
 
 // ============================================================================
@@ -31,33 +29,8 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) 
 	ctx := context.Background()
 	kind = strings.ToLower(kind)
 
-	// Map of kind to watcher factory functions
-	watcherFactories := map[string]func(ctx context.Context, c *Context) (watch.Interface, error){
-		"pod": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().Pods(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"deployment": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.AppsV1().Deployments(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"configmap": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().ConfigMaps(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"secret": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().Secrets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"service": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.CoreV1().Services(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"statefulset": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.AppsV1().StatefulSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-		"daemonset": func(ctx context.Context, c *Context) (watch.Interface, error) {
-			return c.Client.AppsV1().DaemonSets(c.Namespace).Watch(ctx, metav1.ListOptions{})
-		},
-	}
-
-	factory, ok := watcherFactories[kind]
-	if !ok {
+	h := lookupHandler(kind)
+	if h == nil {
 		return nil, &UnsupportedKindError{
 			Operation:      "Watch",
 			Kind:           kind,
@@ -65,7 +38,7 @@ func (c *Context) Watch(kind string, callback func(WatchEvent)) (func(), error) 
 		}
 	}
 
-	watcher, err := factory(ctx, c)
+	watcher, err := h.Watch(ctx, c.Client, c.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -158,64 +131,8 @@ func (c *Context) WaitDeletedTimeout(resource string, timeout time.Duration) err
 
 // resourceExists checks if a resource exists.
 func (c *Context) resourceExists(kind, name string) (bool, error) {
-	ctx := context.Background()
-
-	type existsFunc func(ctx context.Context, c *Context, name string) (bool, error)
-
-	resourceFuncs := map[string]existsFunc{
-		"pod": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"deployment": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"configmap": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"secret": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"service": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"statefulset": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-		"daemonset": func(ctx context.Context, c *Context, name string) (bool, error) {
-			_, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return err == nil, err
-		},
-	}
-
-	if fn, ok := resourceFuncs[kind]; ok {
-		return fn(ctx, c, name)
+	if h := lookupHandler(kind); h != nil {
+		return h.Exists(context.Background(), c.Client, c.Namespace, name)
 	}
 	return false, &UnsupportedKindError{
 		Operation:      "WaitDeleted",

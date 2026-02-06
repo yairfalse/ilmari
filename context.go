@@ -731,69 +731,11 @@ func (c *Context) WaitForTimeout(resource string, condition func(obj interface{}
 
 // getResource fetches a resource by kind and name.
 func (c *Context) getResource(kind, name string) (interface{}, error) {
-	ctx := context.Background()
-
-	switch kind {
-	case "pod":
-		pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return pod, err
-
-	case "deployment":
-		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return deploy, err
-
-	case "statefulset":
-		ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return ss, err
-
-	case "daemonset":
-		ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return ds, err
-
-	case "configmap":
-		cm, err := c.Client.CoreV1().ConfigMaps(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return cm, err
-
-	case "secret":
-		secret, err := c.Client.CoreV1().Secrets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return secret, err
-
-	case "service":
-		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return svc, err
-
-	case "pvc", "persistentvolumeclaim":
-		pvc, err := c.Client.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return pvc, err
-
-	default:
-		// Try dynamic client for CRDs
-		return c.getResourceDynamic(kind, name)
+	if h := lookupHandler(kind); h != nil {
+		return h.Get(context.Background(), c.Client, c.Namespace, name)
 	}
+	// Fallback to dynamic client for CRDs
+	return c.getResourceDynamic(kind, name)
 }
 
 // getResourceDynamic fetches a resource using the dynamic client.
@@ -1003,70 +945,26 @@ func podHints(pod *corev1.Pod) []string {
 
 // isReady checks if a resource is ready based on its type.
 func (c *Context) isReady(kind, name string) (bool, error) {
-	ctx := context.Background()
-
-	switch kind {
-	case "pod":
-		pod, err := c.Client.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isPodReady(pod), nil
-
-	case "deployment":
-		deploy, err := c.Client.AppsV1().Deployments(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isDeploymentReady(deploy), nil
-
-	case "statefulset":
-		ss, err := c.Client.AppsV1().StatefulSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isStatefulSetReady(ss), nil
-
-	case "daemonset":
-		ds, err := c.Client.AppsV1().DaemonSets(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return isDaemonSetReady(ds), nil
-
-	case "pvc", "persistentvolumeclaim":
-		pvc, err := c.Client.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return pvc.Status.Phase == corev1.ClaimBound, nil
-
-	default:
-		// Try dynamic client for CRDs - check status.conditions
-		obj, err := c.getResourceDynamic(kind, name)
+	if h := lookupHandler(kind); h != nil {
+		obj, err := h.Get(context.Background(), c.Client, c.Namespace, name)
 		if err != nil {
 			return false, err
 		}
 		if obj == nil {
 			return false, nil
 		}
-		return c.checkConditions(obj), nil
+		return h.IsReady(obj), nil
 	}
+
+	// Fallback to dynamic client for CRDs - check status.conditions
+	obj, err := c.getResourceDynamic(kind, name)
+	if err != nil {
+		return false, err
+	}
+	if obj == nil {
+		return false, nil
+	}
+	return c.checkConditions(obj), nil
 }
 
 // checkConditions looks for Ready/Accepted/Available/Programmed conditions in CRDs.
