@@ -319,6 +319,164 @@ func TestDefaultConfig(t *testing.T) {
 	_ = cfg.KeepAlways
 }
 
+// ============================================================================
+// podHints tests
+// ============================================================================
+
+func TestPodHints_ImagePullBackOff(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Image: "myapp:v1"}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "myapp:v1")
+	assert.Contains(t, hints[0], "failed to pull")
+}
+
+func TestPodHints_ErrImagePull(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Image: "bad:image"}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "bad:image")
+}
+
+func TestPodHints_CrashLoopBackOff(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "crash-pod"},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "crash-looping")
+	assert.Contains(t, hints[0], "crash-pod")
+}
+
+func TestPodHints_CreateContainerConfigError(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CreateContainerConfigError"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "configuration error")
+}
+
+func TestPodHints_OOMKilled(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "OOMKilled"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "Out of Memory")
+}
+
+func TestPodHints_NonZeroExitCode(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "exit-pod"},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason:   "Error",
+					ExitCode: 137,
+				}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "137")
+	assert.Contains(t, hints[0], "exit-pod")
+}
+
+func TestPodHints_PendingUnschedulable(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:    corev1.PodScheduled,
+					Status:  corev1.ConditionFalse,
+					Message: "0/3 nodes available: insufficient memory",
+				},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "cannot be scheduled")
+	assert.Contains(t, hints[0], "insufficient memory")
+}
+
+func TestPodHints_RunningHealthy_NoHints(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Ready: true, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Empty(t, hints)
+}
+
+func TestPodHints_ContainerCreating(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "still being created")
+}
+
+func TestPodHints_PodInitializing(t *testing.T) {
+	pod := &corev1.Pod{
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}},
+			},
+		},
+	}
+	hints := podHints(pod)
+	assert.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "Init containers")
+}
+
+// ============================================================================
+// Timeout configuration tests
+// ============================================================================
+
 func TestDefaultTimeoutConstants(t *testing.T) {
 	assert.Equal(t, 60*time.Second, DefaultWaitTimeout)
 	assert.Equal(t, 1*time.Second, DefaultPollInterval)
