@@ -182,7 +182,7 @@ type Traffic struct {
 }
 
 // StartTraffic starts generating HTTP traffic to a service.
-func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffic {
+func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) (*Traffic, error) {
 	config := TrafficConfig{
 		rps:      10,
 		duration: 10 * time.Second,
@@ -191,7 +191,10 @@ func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffi
 	fn(&config)
 
 	// Set up port forward
-	pf := c.PortForward(resource, 80)
+	pf, err := c.PortForward(resource, 80)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set up port forward: %w", err)
+	}
 
 	traffic := &Traffic{
 		ctx:       c,
@@ -204,17 +207,13 @@ func (c *Context) StartTraffic(resource string, fn func(*TrafficConfig)) *Traffi
 	// Start traffic generation in background
 	go traffic.run()
 
-	return traffic
+	return traffic, nil
 }
 
 // run generates traffic in the background.
 func (t *Traffic) run() {
 	defer close(t.done)
 	defer t.pf.Close()
-
-	if t.pf.err != nil {
-		return
-	}
 
 	interval := time.Duration(float64(time.Second) / float64(t.config.rps))
 	ticker := time.NewTicker(interval)

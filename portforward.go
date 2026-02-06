@@ -23,7 +23,6 @@ type PortForward struct {
 	stopChan   chan struct{}
 	doneChan   chan struct{}
 	httpClient *http.Client
-	err        error
 	closeOnce  sync.Once
 }
 
@@ -43,9 +42,6 @@ func (pf *PortForward) Close() {
 // Get makes an HTTP GET request through the port forward.
 // Caller is responsible for closing the response body.
 func (pf *PortForward) Get(path string) (*http.Response, error) {
-	if pf.err != nil {
-		return nil, pf.err
-	}
 	return pf.httpClient.Get(pf.URL(path))
 }
 
@@ -57,18 +53,12 @@ func (pf *PortForward) URL(path string) string {
 // Post makes an HTTP POST request through the port forward.
 // Caller is responsible for closing the response body.
 func (pf *PortForward) Post(path, contentType string, body io.Reader) (*http.Response, error) {
-	if pf.err != nil {
-		return nil, pf.err
-	}
 	return pf.httpClient.Post(pf.URL(path), contentType, body)
 }
 
 // Put makes an HTTP PUT request through the port forward.
 // Caller is responsible for closing the response body.
 func (pf *PortForward) Put(path, contentType string, body io.Reader) (*http.Response, error) {
-	if pf.err != nil {
-		return nil, pf.err
-	}
 	req, err := http.NewRequest(http.MethodPut, pf.URL(path), body)
 	if err != nil {
 		return nil, err
@@ -80,9 +70,6 @@ func (pf *PortForward) Put(path, contentType string, body io.Reader) (*http.Resp
 // Delete makes an HTTP DELETE request through the port forward.
 // Caller is responsible for closing the response body.
 func (pf *PortForward) Delete(path string) (*http.Response, error) {
-	if pf.err != nil {
-		return nil, pf.err
-	}
 	req, err := http.NewRequest(http.MethodDelete, pf.URL(path), nil)
 	if err != nil {
 		return nil, err
@@ -94,18 +81,15 @@ func (pf *PortForward) Delete(path string) (*http.Response, error) {
 // Use this for PATCH, OPTIONS, or requests with custom headers.
 // Caller is responsible for closing the response body.
 func (pf *PortForward) Do(req *http.Request) (*http.Response, error) {
-	if pf.err != nil {
-		return nil, pf.err
-	}
 	return pf.httpClient.Do(req)
 }
 
 // PortForward creates a port forward to a pod or service.
 // Resource format: "svc/name" or "pod/name"
-func (c *Context) PortForward(resource string, port int) *PortForward {
+func (c *Context) PortForward(resource string, port int) (*PortForward, error) {
 	ref, err := ParseResourceRef(resource)
 	if err != nil {
-		return &PortForward{err: err}
+		return nil, err
 	}
 
 	kind := ref.Kind
@@ -122,7 +106,7 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 		// Get service and find a pod
 		svc, err := c.Client.CoreV1().Services(c.Namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return &PortForward{err: fmt.Errorf("failed to get service: %w", err)}
+			return nil, fmt.Errorf("failed to get service: %w", err)
 		}
 
 		// Find pods matching the service selector
@@ -130,25 +114,25 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 			LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
 		})
 		if err != nil {
-			return &PortForward{err: fmt.Errorf("failed to list pods: %w", err)}
+			return nil, fmt.Errorf("failed to list pods: %w", err)
 		}
 		if len(pods.Items) == 0 {
-			return &PortForward{err: fmt.Errorf("no pods found for service %s", name)}
+			return nil, fmt.Errorf("no pods found for service %s", name)
 		}
 		podName = pods.Items[0].Name
 	default:
-		return &PortForward{err: fmt.Errorf("unsupported kind %q, use pod or svc", kind)}
+		return nil, fmt.Errorf("unsupported kind %q, use pod or svc", kind)
 	}
 
 	// Set up port forward
 	config, err := clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to get config: %w", err)}
+		return nil, fmt.Errorf("failed to get config: %w", err)
 	}
 
 	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to create round tripper: %w", err)}
+		return nil, fmt.Errorf("failed to create round tripper: %w", err)
 	}
 
 	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", c.Namespace, podName)
@@ -165,7 +149,7 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 	ports := []string{fmt.Sprintf("0:%d", port)}
 	pf, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard)
 	if err != nil {
-		return &PortForward{err: fmt.Errorf("failed to create port forward: %w", err)}
+		return nil, fmt.Errorf("failed to create port forward: %w", err)
 	}
 
 	doneChan := make(chan struct{})
@@ -179,12 +163,12 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 	select {
 	case <-readyChan:
 	case err := <-errChan:
-		return &PortForward{err: fmt.Errorf("port forward failed: %w", err)}
+		return nil, fmt.Errorf("port forward failed: %w", err)
 	}
 
 	forwardedPorts, err := pf.GetPorts()
 	if err != nil || len(forwardedPorts) == 0 {
-		return &PortForward{err: fmt.Errorf("failed to get forwarded ports: %w", err)}
+		return nil, fmt.Errorf("failed to get forwarded ports: %w", err)
 	}
 
 	return &PortForward{
@@ -192,15 +176,15 @@ func (c *Context) PortForward(resource string, port int) *PortForward {
 		stopChan:   stopChan,
 		doneChan:   doneChan,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
-	}
+	}, nil
 }
 
 // MustPortForward creates a port forward and panics on error.
 // Useful for test setup where errors should fail immediately.
 func (c *Context) MustPortForward(resource string, port int) *PortForward {
-	pf := c.PortForward(resource, port)
-	if pf.err != nil {
-		panic(fmt.Sprintf("MustPortForward failed: %v", pf.err))
+	pf, err := c.PortForward(resource, port)
+	if err != nil {
+		panic(fmt.Sprintf("MustPortForward failed: %v", err))
 	}
 	return pf
 }

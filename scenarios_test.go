@@ -116,11 +116,14 @@ func TestTrafficGenerator(t *testing.T) {
 		}
 
 		// Start traffic
-		traffic := ctx.StartTraffic("svc/traffic-test", func(t *TrafficConfig) {
+		traffic, err := ctx.StartTraffic("svc/traffic-test", func(t *TrafficConfig) {
 			t.RPS(10)
 			t.Duration(5 * time.Second)
 			t.Endpoint("/")
 		})
+		if err != nil {
+			t.Fatalf("StartTraffic failed: %v", err)
+		}
 
 		// Wait for traffic to complete
 		traffic.Wait()
